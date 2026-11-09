@@ -234,6 +234,32 @@ case "$cmd" in
     if (( THREADS > 32 )); then
       THREADS=32
     fi
+    # IP pool is opt-in. Each allowlisted leaf gets its own local port, and
+    # workers are capped at the pool size so two attempts never share an exit.
+    # A plain ./register.sh typesafe N keeps the fixed :7897 profile.
+    if [[ "${TYPESAFE_IP_POOL:-0}" == "1" ]]; then
+      _POOL="$ROOT/profiles/typesafe-us-pool.txt"
+      if [[ ! -f "$_POOL" ]]; then
+        echo "register.sh: TYPESAFE_IP_POOL=1 but missing $_POOL" >&2
+        exit 2
+      fi
+      export REGISTER_EGRESS="${REGISTER_EGRESS:-clash}"
+      export CLASH_API="${CLASH_API:-http://127.0.0.1:9090}"
+      export CLASH_CONFIG_PATH="${CLASH_CONFIG_PATH:-/personal/clash/config.yaml}"
+      export CLASH_GROUP="${CLASH_GROUP:-TYPESAFE-US}"
+      export CLASH_DONOR_GROUP="${CLASH_DONOR_GROUP:-AUTO}"
+      export CLASH_DOMAINS="${CLASH_DOMAINS:-typesafe.ai}"
+      export CLASH_LEAF_BASE_PORT="${CLASH_LEAF_BASE_PORT:-18011}"
+      export CLASH_NODE_ALLOWLIST
+      CLASH_NODE_ALLOWLIST="$(grep -ve '^[[:space:]]*$' -e '^[[:space:]]*#' "$_POOL" | paste -sd, -)"
+      export PROXY_ROTATE_MODE="${PROXY_ROTATE_MODE:-clash}"
+      export PROXY_ROTATE_EVERY="${PROXY_ROTATE_EVERY:-1}"
+      export PROXY_ROTATE_REQUIRED="${PROXY_ROTATE_REQUIRED:-1}"
+      _POOL_N=$(grep -cve '^[[:space:]]*$' -e '^[[:space:]]*#' "$_POOL" || true)
+      if [[ "$_POOL_N" =~ ^[0-9]+$ ]] && (( _POOL_N >= 1 && THREADS > _POOL_N )); then
+        THREADS="$_POOL_N"
+      fi
+    fi
     if [[ "${TYPESAFE_LEGACY:-0}" != "1" ]]; then
       if [[ -d "$ROOT/.venv" && -x "$ROOT/.venv/bin/python" ]]; then
         _PY="$ROOT/.venv/bin/python"
@@ -267,6 +293,9 @@ case "$cmd" in
       [[ -n "${TYPESAFE_PROXY:-}" ]] && _ARGS+=(--proxy "$TYPESAFE_PROXY")
       [[ -n "${TYPESAFE_PROXY_LIST:-}" ]] && _ARGS+=(--proxy-list "$TYPESAFE_PROXY_LIST")
       [[ -n "${TYPESAFE_PROXY_ROTATE_MODE:-}" ]] && _ARGS+=(--proxy-rotate "$TYPESAFE_PROXY_ROTATE_MODE")
+      if [[ "${TYPESAFE_IP_POOL:-0}" == "1" ]]; then
+        _ARGS+=(--proxy-rotate clash --proxy-rotate-every 1 --proxy-rotate-required)
+      fi
       if [[ -n "${TYPESAFE_PROXY_ROTATE_EVERY:-}" ]]; then
         _ARGS+=(--proxy-rotate-every "$TYPESAFE_PROXY_ROTATE_EVERY")
       fi

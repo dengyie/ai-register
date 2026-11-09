@@ -1,0 +1,11 @@
+# typesafe IP pool. One Clash leaf name per line.
+# Source: pxed 3x-ui subscription files (airport-2-baokemo.txt, clash-all.txt),
+# delay-proven against https://www.google.com/generate_204 on 2026-09-22.
+# google-vps (TUIC-googlevps / AnyTLS-googlevps) is excluded.
+# Reachability changes; a name that is no longer a live leaf is dropped at setup.
+BK-🇺🇸【北美洲】美国01原生丨直连【2x】
+BK-🇺🇸【北美洲】美国02原生丨直连【2x】
+BK-🇺🇸【北美洲】美国03原生丨直连【2x】
+BK-🇺🇸【北美洲】美国04原生丨直连【2x】
+🇺🇸【北美洲】美国01原生丨直连【2x】
+🇺🇸【北美洲】美国03原生丨直连【2x】

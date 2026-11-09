@@ -78,6 +78,39 @@ class TestProfileParse(unittest.TestCase):
         with self.assertRaises(ProfileLoadError):
             parse_profile_dict(raw, source_path="bad.yaml")
 
+    def test_prod_allows_mode_enum_under_token_named_key(self):
+        """`mail_token_mode: graph` is an enum name, not credential material —
+        the secrets policy must not false-positive on the `token` substring
+        inside a *_mode key (loader skips keys ending in _mode)."""
+        raw = {
+            "apiVersion": "register.v1",
+            "spec": {
+                "provider": {
+                    "name": "outlook",
+                    "options": {"mode": "protocol", "mail_token_mode": "graph"},
+                },
+                "mailbox": {"type": "gmail_imap"},
+                "decode": {"type": "gmail_imap"},
+                "secrets": {"mode": "prod"},
+            },
+        }
+        p = parse_profile_dict(raw, source_path="ok.yaml")
+        self.assertEqual(p.secrets.mode, "prod")
+
+    def test_prod_still_rejects_token_value_on_non_mode_key(self):
+        raw = {
+            "apiVersion": "register.v1",
+            "spec": {
+                "provider": {"name": "chatgpt"},
+                "mailbox": {"type": "gmail_imap"},
+                "decode": {"type": "gmail_imap"},
+                "secrets": {"mode": "prod"},
+                "api_key": "sk-live-123",
+            },
+        }
+        with self.assertRaises(ProfileLoadError):
+            parse_profile_dict(raw, source_path="bad.yaml")
+
     def test_prod_allows_env_ref(self):
         raw = {
             "apiVersion": "register.v1",

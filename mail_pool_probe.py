@@ -8,6 +8,8 @@ Security: never log or return password / client_id / refresh_token.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import random
@@ -1190,6 +1192,74 @@ def update_refresh_token_in_pool(
         tmp.write_text("".join(out), encoding="utf-8")
         os.replace(tmp, live)
         return True
+
+
+@contextlib.contextmanager
+def pool_file_lock(live_path: Path | str):
+    """Cross-process advisory lock (fcntl.flock) over the live pool file.
+
+    Thread re-entrancy is guaranteed by the in-process ``_file_lock`` first;
+    the OS lock then serializes other processes (TTK, register_core workers,
+    control_api) that mutate the same file. The lock file lives next to the
+    pool as ``<name>.lock`` and is never removed.
+    """
+    live = Path(live_path)
+    lock_path = live.with_name(live.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _file_lock:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def format_pool_line(credential: Credential) -> str:
+    """Canonical four-segment live pool line with trailing newline."""
+    return (
+        f"{credential.email}----{credential.password}----"
+        f"{credential.client_id}----{credential.refresh_token}\n"
+    )
+
+
+def append_credentials_to_pool(
+    live_path: Path | str,
+    credential: Credential,
+    *,
+    allow_duplicate: bool = False,
+) -> bool:
+    """Append one verified credential to the live pool (replenish writeback).
+
+    Deduped by lowercased email unless ``allow_duplicate``. Cross-process safe:
+    holds ``pool_file_lock`` (fcntl) and appends via an OS-locked append write
+    (per-write atomic on local filesystems) so a concurrent reader never
+    observes a torn line. Returns True when appended.
+    """
+    if not credential.email or "@" not in credential.email:
+        return False
+    if not credential.client_id or not credential.refresh_token:
+        return False
+    live = Path(live_path)
+    key = credential.email.strip().lower()
+    with pool_file_lock(live):
+        if live.is_file():
+            for raw in live.read_text(encoding="utf-8-sig").splitlines():
+                item = parse_credential_line(raw)
+                if item and item.email.strip().lower() == key and not allow_duplicate:
+                    return False
+        else:
+            live.parent.mkdir(parents=True, exist_ok=True)
+        # Append under the OS lock (not temp+replace: rewriting the whole file
+        # here would clobber lines appended by another process between read
+        # and replace; append is atomic per write call on local filesystems).
+        with live.open("a", encoding="utf-8") as f:
+            f.write(format_pool_line(credential))
+            f.flush()
+            os.fsync(f.fileno())
+    return True
 
 
 def probe_one(

@@ -23,6 +23,24 @@ from register_core.verify.registry import get_verifier
 
 log = logging.getLogger("register_core.pipeline")
 
+
+def _release_leaf(attempt_extra: dict[str, Any] | None) -> None:
+    """Hand a per-node listener back once the attempt that claimed it is done."""
+    if not isinstance(attempt_extra, dict):
+        return
+    rot = attempt_extra.get("_proxy_rotate")
+    if not isinstance(rot, dict) or rot.get("reason") != "leaf_listener":
+        return
+    node = str(rot.get("node") or "").strip()
+    if not node:
+        return
+    try:
+        from proxy_rotate import release_leaf
+
+        release_leaf(node)
+    except Exception:
+        log.debug("leaf release skipped", exc_info=True)
+
 # Shell adapters that historically owned mail internally; M3/M4 consume EmailSource
 # via FIXED_EMAIL (+ optional OTP bridge). Kept only for docs / legacy messages.
 _SHELL_PROVIDERS = frozenset({"grok", "mimo", "xai", "xiaomi", "mimo-tts"})
@@ -410,6 +428,7 @@ class Pipeline:
                 ),
                 attempt_extra,
             )
+            _release_leaf(attempt_extra)
             return _AttemptOutcome(
                 result=result,
                 should_stop=True,
@@ -438,6 +457,7 @@ class Pipeline:
                 ),
                 attempt_extra,
             )
+            _release_leaf(attempt_extra)
             return _AttemptOutcome(
                 result=result,
                 should_stop=self.fail_fast,
@@ -454,6 +474,7 @@ class Pipeline:
                 ),
                 attempt_extra,
             )
+            _release_leaf(attempt_extra)
             return _AttemptOutcome(
                 result=result,
                 should_stop=self.fail_fast,
@@ -470,6 +491,7 @@ class Pipeline:
                 ),
                 attempt_extra,
             )
+            _release_leaf(attempt_extra)
             return _AttemptOutcome(
                 result=result,
                 should_stop=self.fail_fast,
@@ -490,6 +512,7 @@ class Pipeline:
                 result.error = f"verify: {exc}"
                 result.error_kind = "verify"
 
+        _release_leaf(attempt_extra)
         return _AttemptOutcome(result=_stash(result, attempt_extra), verify=verify)
 
     def _commit_attempt(self, stats: "PipelineStats", outcome: _AttemptOutcome) -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,8 +20,51 @@ from register_core.verify.chatgpt_token import ChatGPTTokenVerifier
 from register_core.verify.noop import NoopVerifier
 from register_core.verify.registry import get_verifier
 
+# Adapter tests call provider.register_one() with `proxy=""`, which still goes
+# through resolve_attempt_proxy → configure_rotation_once. Without isolation
+# that can load the real nodes.json and leave the proxy_rotate module
+# singleton in list mode, polluting later test files (e.g. test_proxy_rotate).
+_ISOLATED_ENV_KEYS = (
+    "REGISTER_NODES",
+    "REGISTER_NODES_FILE",
+    "NODES_FILE",
+    "USE_NODES",
+    "PROXY_LIST",
+    "PROXY_POOL",
+    "PROXY_ROTATE_MODE",
+    "REGISTER_EGRESS",
+    "EGRESS_BACKEND",
+    "CHATGPT_PROXY_LIST",
+    "CHATGPT_PROXY",
+)
+
+
+class _ProxyIsolationMixin(unittest.TestCase):
+    """Keep real nodes.json / proxy rotation out of adapter unit tests."""
+
+    def setUp(self) -> None:
+        from register_core.util.proxy import reset_rotation_for_tests
+
+        reset_rotation_for_tests()
+        self._env_backup = {
+            k: os.environ.pop(k, None) for k in _ISOLATED_ENV_KEYS
+        }
+        os.environ["REGISTER_NODES"] = "0"
+        os.environ["REGISTER_EGRESS"] = "direct"
+
+    def tearDown(self) -> None:
+        from register_core.util.proxy import reset_rotation_for_tests
+
+        reset_rotation_for_tests()
+        for k in _ISOLATED_ENV_KEYS:
+            os.environ.pop(k, None)
+        for k, v in self._env_backup.items():
+            if v is not None:
+                os.environ[k] = v
+
 
 class FakeEmail:
+
     name = "fake"
 
     def __init__(self, *, fail_otp: bool = False) -> None:
@@ -176,7 +220,7 @@ class TestChatGPTProtocolHelpers(unittest.TestCase):
         self.assertTrue(any("human_pace" in x and "after_authorize" in x for x in logs))
 
 
-class TestChatGPTAdapterUsedCodes(unittest.TestCase):
+class TestChatGPTAdapterUsedCodes(_ProxyIsolationMixin):
     def test_otp_provider_accumulates_used_codes_across_polls(self):
         """Resend path must pass previously returned codes as used_codes."""
         email = FakeEmail()
@@ -218,7 +262,7 @@ class TestChatGPTAdapterUsedCodes(unittest.TestCase):
         self.assertIn("111111", second_used)
 
 
-class TestChatGPTAdapterAttribution(unittest.TestCase):
+class TestChatGPTAdapterAttribution(_ProxyIsolationMixin):
     def test_success_from_this_run_only(self):
         """Historical accounts.jsonl must not make ok=True without protocol result."""
         email = FakeEmail()

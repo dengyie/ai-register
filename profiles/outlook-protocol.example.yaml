@@ -1,0 +1,68 @@
+# Protocol-mode Outlook profile (pure HTTP MSA flow, no browser).
+#
+# Usage (live — gated, requires explicit operator authorization):
+#   GROK_REGISTER_OUTLOOK_LIVE=1 \
+#   CAPTCHA_RUN_KEY="<captcha.run key>" \
+#   OUTLOOK_PROXY="http://user:pass@host:port" \
+#   .venv/bin/python -m register_core run \
+#     --profile profiles/outlook-protocol.example.yaml \
+#     --proxy "$OUTLOOK_PROXY" -n 1
+# (core reads the proxy from the --proxy flag / CHATGPT_PROXY env chain —
+#  OUTLOOK_PROXY alone is only consumed by register.sh's browser case.)
+#
+# What protocol mode changes vs the browser path:
+#   * options.mode: protocol — the provider drives providers/outlook/protocol/
+#     msa_flow.register_one (signup ServerData → risk chain → CreateAccount →
+#     mail OAuth) instead of OutlookRegistrationFlow + FunCaptcha handoff.
+#   * options.mail_token_mode: graph (Graph REST read; one-mail graph_outlook path)
+#     or login_exe (Thunderbird IMAP/POP/SMTP set; one-mail imap_outlook path).
+#   * country drives mkt/lc/timezone (see providers/outlook/protocol/constants.py);
+#     all three must match the egress IP's geo — see docs/ANTIBAN.md.
+#   * captcha: captcha.run press/silent fallback (CAPTCHA_RUN_KEY required);
+#     local PX solving is a stretch goal (docs/outlook-protocol-notes.md §2).
+#
+# Pacing (all env-tunable, defaults in providers/outlook/protocol/pacing.py):
+#   OUTLOOK_STEP_JITTER_MIN/MAX   step delay seconds (default 3–8)
+#   OUTLOOK_REG_JITTER_MIN/MAX    inter-account delay MINUTES (default 3–8)
+#   OUTLOOK_COLD_START_MIN/MAX    first-account delay seconds (default 30–90)
+#
+# strategy.burn [ip, proxy]: repeated failures on the same egress IP/proxy pair
+# get burnt by the StrategyEngine. The pipeline wires the proxy from
+# extra["proxy"] and the IP from extra["_egress_ip"] (TTL-cached probe per
+# proxy URL in register_core/util/proxy.py).
+
+apiVersion: register.v1
+kind: RegisterProfile
+metadata:
+  name: outlook-protocol
+  description: Outlook pure-protocol registration (MSA HTTP flow, captcha.run)
+
+spec:
+  provider:
+    name: outlook
+    options:
+      mode: protocol
+      mail_token_mode: graph
+      country: US
+      email_suffix: outlook.com
+      # Phone gate (CreateAccount 1312 field=phoneNumber): "env" resolves the
+      # SMS source from environment (OUTLOOK_SMS_API_KEY secret, optional
+      # OUTLOOK_SMS_BASE / OUTLOOK_SMS_SERVICE overrides; default platform
+      # base is sms-activate.org, service code "mp" — verify the Outlook code
+      # in the platform UI). Empty disables the gate pass (default).
+      # sms_provider: env
+  count: 1
+
+  strategy:
+    fail_fast: true
+    fail_fast_kinds:
+      - provider
+      - fatal
+      - proxy
+      - token
+      - registration_disallowed
+    burn:
+      - ip
+      - proxy
+    egress:
+      mode: direct

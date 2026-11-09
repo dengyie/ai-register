@@ -124,6 +124,154 @@ def test_clash_mode_guards_main_group() -> None:
     print("PASS clash guards main group")
 
 
+def test_allowlist_keeps_only_named_live_leaves() -> None:
+    proxies = {
+        "AUTO": {
+            "type": "Selector",
+            "all": ["US-A", "US-B", "HK-1", "TUIC-googlevps"],
+            "now": "HK-1",
+        },
+        "US-A": {"type": "Hysteria2"},
+        "US-B": {"type": "Hysteria2"},
+        "HK-1": {"type": "Vmess"},
+        "TUIC-googlevps": {"type": "Tuic"},
+        "DIRECT": {"type": "Direct"},
+    }
+    got = pr._leaf_nodes_from_donor(
+        proxies,
+        "AUTO",
+        exclude_re=pr._DEFAULT_CLASH_EXCLUDE,
+        allowlist=["US-B", "US-A", "TUIC-googlevps", "not-loaded"],
+    )
+    # googlevps matches the default exclude; unknown names are dropped
+    assert got == ["US-B", "US-A"], got
+    print("PASS allowlist keeps only named live leaves")
+
+
+def test_replace_members_rewrites_only_that_group(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    yaml = tmp_path / "clash.yaml"
+    yaml.write_text(
+        "\n".join(
+            [
+                "mixed-port: 7897",
+                "proxy-groups:",
+                "- name: PROXY",
+                "  type: select",
+                "  proxies:",
+                "  - HK-1",
+                "- name: TYPESAFE-US",
+                "  type: select",
+                "  proxies:",
+                '  - "OLD"',
+                "rules:",
+                "- MATCH,PROXY",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    changed = pr._inject_group_and_rules_into_runtime_yaml(
+        yaml,
+        group="TYPESAFE-US",
+        nodes=["US-A", "US-B"],
+        domains=["typesafe.ai"],
+        replace_members=True,
+    )
+    assert changed is True
+    text = yaml.read_text(encoding="utf-8")
+    assert pr._group_member_names(text, "PROXY") == ["HK-1"]
+    assert pr._group_member_names(text, "TYPESAFE-US") == ["US-A", "US-B"]
+    assert "DOMAIN-SUFFIX,typesafe.ai,TYPESAFE-US" in text
+    # second pass with the same members is a no-op aside from rules already present
+    again = pr._inject_group_and_rules_into_runtime_yaml(
+        yaml,
+        group="TYPESAFE-US",
+        nodes=["US-A", "US-B"],
+        domains=["typesafe.ai"],
+        replace_members=True,
+    )
+    assert again is False
+    print("PASS replace members rewrites only that group")
+
+
+def test_leaf_listeners_are_added_without_touching_existing(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    yaml = tmp_path / "clash.yaml"
+    yaml.write_text(
+        "\n".join(
+            [
+                "mixed-port: 7897",
+                "listeners:",
+                "- name: cpa-clean-egress",
+                "  type: mixed",
+                "  port: 10821",
+                "  listen: 127.0.0.1",
+                "  proxy: cpa-clean-egress",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    changed, mapping = pr._inject_leaf_listeners_into_runtime_yaml(
+        yaml, nodes=["US-A", "US-B"], base_port=18011
+    )
+    assert changed is True
+    assert mapping == {"US-A": "http://127.0.0.1:18011", "US-B": "http://127.0.0.1:18012"}
+    text = yaml.read_text(encoding="utf-8")
+    assert "name: cpa-clean-egress" in text
+    assert 'proxy: "US-A"' in text
+    assert "port: 10821" in text
+    again, _ = pr._inject_leaf_listeners_into_runtime_yaml(
+        yaml, nodes=["US-A", "US-B"], base_port=18011
+    )
+    assert again is False
+    print("PASS leaf listeners leave existing listeners alone")
+
+
+def test_leaf_claim_returns_distinct_urls() -> None:
+    rot = pr.ProxyRotator()
+    rot.configure(
+        {
+            "proxy_rotate_mode": "clash",
+            "proxy_rotate_every": 1,
+            "clash_api": "unix:///tmp/fake.sock",
+            "clash_proxy_group": "TYPESAFE-US",
+            "clash_donor_group": "AUTO",
+            "clash_restore_on_exit": False,
+        }
+    )
+    rot.clash_setup_done = True
+    rot.leaf_listeners = {
+        "US-A": "http://127.0.0.1:18011",
+        "US-B": "http://127.0.0.1:18012",
+    }
+
+    def fake_list(api, group, **k):
+        return ["US-A", "US-B"], "US-A", {}
+
+    with patch.object(pr, "clash_list_nodes", side_effect=fake_list):
+        with patch.object(pr, "clash_switch_node") as switched:
+            a = rot.maybe_rotate(log=None)
+            b = rot.maybe_rotate(log=None)
+            assert switched.call_count == 0
+    assert a["proxy"] == "http://127.0.0.1:18011"
+    assert b["proxy"] == "http://127.0.0.1:18012"
+    assert a["node"] != b["node"]
+    # The shared current_proxy is last-writer-wins. Callers must use the
+    # proxy returned by this rotate, which is what the two asserts above are.
+    assert pr.current_proxy_override() == ""
+    with patch.object(pr, "clash_list_nodes", side_effect=fake_list):
+        # Both leaves are held. Overflow must leave US-A, not pin it.
+        overflow = rot.maybe_rotate(log=None)
+    assert overflow["node"] == "US-B", overflow
+    pr.release_leaf(a["node"])
+    with patch.object(pr, "clash_list_nodes", side_effect=fake_list):
+        c = rot.maybe_rotate(log=None)
+    assert c["node"] == a["node"]
+    print("PASS leaf claim returns distinct urls")
+
+
 def test_clash_setup_injects_group_and_rules(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     yaml = tmp_path / "clash.yaml"
@@ -426,6 +574,10 @@ def main() -> int:
     test_list_mode_rotates_and_applies_to_config()
     test_list_mode_every_two()
     test_clash_mode_guards_main_group()
+    test_allowlist_keeps_only_named_live_leaves()
+    test_replace_members_rewrites_only_that_group(Path("/tmp/_grok_reg_test_members"))
+    test_leaf_listeners_are_added_without_touching_existing(Path("/tmp/_grok_reg_test_leaves"))
+    test_leaf_claim_returns_distinct_urls()
     test_clash_setup_injects_group_and_rules(Path("/tmp/_grok_reg_test"))
     test_clash_mode_rotate_and_restore()
     test_clash_mode_refuses_main_group_at_runtime()
