@@ -48,6 +48,9 @@ _ENV_KEYS = (
     "CLASH_CONFIG_PATH",
     "CLASH_DOMAINS",
     "CLASH_RULE_DOMAINS",
+    "CLASH_NODE_ALLOWLIST",
+    "CLASH_DONOR_GROUP",
+    "CLASH_LEAF_BASE_PORT",
     "REGISTER_CORE_AUTOSTART",
     "USE_CLASH",
 )
@@ -123,6 +126,56 @@ class TestRotationConfig(unittest.TestCase):
         self.assertEqual(extra.get("proxy"), "http://only:9")
         self.assertEqual(extra.get("_proxy_rotate", {}).get("mode"), "list")
 
+    def test_inject_attempt_proxy_writes_cached_egress_ip(self) -> None:
+        """F-5: burn[ip] needs extra["_egress_ip"]; probe result must be cached
+        per proxy URL so repeated attempts don't re-probe."""
+        core_proxy.reset_egress_ip_cache_for_tests()
+        calls = []
+
+        def fake_probe(proxy, *, timeout=10.0, urls=None):
+            calls.append(proxy)
+            return {"ok": True, "ip": "203.0.113.7"}
+
+        with patch.object(core_proxy, "_EGRESS_IP_TTL_S", 600.0):
+            with patch(
+                "register_core.nodes.health.probe_egress_ip", side_effect=fake_probe
+            ):
+                extra = core_proxy.inject_attempt_proxy(
+                    {
+                        "proxy_list": "http://only:9",
+                        "proxy_rotate_on_start": True,
+                        "egress": "list",
+                    }
+                )
+                self.assertEqual(extra.get("_egress_ip"), "203.0.113.7")
+                # second attempt, same proxy → served from cache
+                extra2 = core_proxy.inject_attempt_proxy(
+                    {
+                        "proxy_list": "http://only:9",
+                        "egress": "list",
+                    }
+                )
+                self.assertEqual(extra2.get("_egress_ip"), "203.0.113.7")
+        self.assertEqual(calls, ["http://only:9"])
+        core_proxy.reset_egress_ip_cache_for_tests()
+
+    def test_inject_attempt_proxy_probe_failure_is_degraded_not_fatal(self) -> None:
+        core_proxy.reset_egress_ip_cache_for_tests()
+        with patch(
+            "register_core.nodes.health.probe_egress_ip",
+            side_effect=RuntimeError("boom"),
+        ):
+            extra = core_proxy.inject_attempt_proxy(
+                {
+                    "proxy_list": "http://only:9",
+                    "proxy_rotate_on_start": True,
+                    "egress": "list",
+                }
+            )
+        self.assertEqual(extra.get("proxy"), "http://only:9")
+        self.assertNotIn("_egress_ip", extra)
+        core_proxy.reset_egress_ip_cache_for_tests()
+
     def test_pipeline_passes_rotated_proxy_to_provider(self) -> None:
         from register_core.contracts import RegisterResult
         from register_core.pipeline import Pipeline
@@ -168,6 +221,18 @@ class TestRotationConfig(unittest.TestCase):
         self.assertIn("7897", cfg.get("proxy") or "")
         self.assertFalse(cfg.get("core_pool"))
 
+    def test_clash_secret_read_from_config_not_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.yaml"
+            cfg_path.write_text("secret: do-not-print\nmixed-port: 7897\n", encoding="utf-8")
+            os.environ["CLASH_CONFIG_PATH"] = str(cfg_path)
+            cfg = core_proxy.rotation_config_from_env_and_extra({"egress": "clash"})
+        self.assertEqual(cfg["clash_secret"], "do-not-print")
+        # Reader contract only: the controller needs the value in the dict.
+        # Logging discipline (never print cfg) is enforced by callers, and the
+        # reader itself does not log the secret — asserting it appears in
+        # repr() would lock in the opposite of the intent.
+
     def test_clash_env_passes_api_group_config_path(self) -> None:
         os.environ["CLASH_API"] = "http://127.0.0.1:9090"
         os.environ["CLASH_SECRET"] = "sekrit"
@@ -179,6 +244,18 @@ class TestRotationConfig(unittest.TestCase):
         self.assertEqual(cfg["clash_proxy_group"], "🎯Grok注册")
         # pxed standalone mihomo: rotator must read live config, not macOS Verge path
         self.assertEqual(cfg["clash_config_path"], "/personal/clash/config.yaml")
+
+    def test_clash_allowlist_env_passes_through(self) -> None:
+        os.environ["CLASH_NODE_ALLOWLIST"] = "node-a,node-b"
+        os.environ["CLASH_DONOR_GROUP"] = "AUTO"
+        cfg = core_proxy.rotation_config_from_env_and_extra({"egress": "clash"})
+        self.assertEqual(cfg["clash_node_allowlist"], "node-a,node-b")
+        self.assertEqual(cfg["clash_donor_group"], "AUTO")
+
+    def test_clash_leaf_port_env_passes_through(self) -> None:
+        os.environ["CLASH_LEAF_BASE_PORT"] = "18011"
+        cfg = core_proxy.rotation_config_from_env_and_extra({"egress": "clash"})
+        self.assertEqual(cfg["clash_leaf_base_port"], 18011)
 
     def test_clash_config_path_absent_by_default(self) -> None:
         cfg = core_proxy.rotation_config_from_env_and_extra({"egress": "clash"})

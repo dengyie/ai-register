@@ -1,0 +1,60 @@
+# Example: Outlook protocol registration + one-mail domain mailbox pool.
+#
+# one-mail supplies recovery/proof targets and OTP receiving for the freshly
+# registered Outlook accounts (server-side verifcode extraction — no local
+# body scraping). Secrets stay in env, never in this file:
+#
+#   export ONEMAIL_API_BASE="https://mail.example.com"
+#   export ONEMAIL_EMAILS="recovery1@dengyie.tech:pw,recovery2@dengyie.tech:pw"
+#   GROK_REGISTER_OUTLOOK_LIVE=1 \
+#   .venv/bin/python -m register_core run \
+#     --profile profiles/outlook-onemail.example.yaml --proxy "$OUTLOOK_PROXY" -n 1
+#
+# Pool discipline (vault): 一号一箱 — each pool address binds to exactly one
+# Outlook account; rotate the pool, do not reuse addresses across accounts.
+
+apiVersion: register.v1
+kind: RegisterProfile
+metadata:
+  name: outlook-onemail
+  description: Outlook protocol mode + one-mail domain mailbox (recovery/OTP)
+
+spec:
+  provider:
+    name: outlook
+    options:
+      mode: protocol
+      mail_token_mode: graph
+      country: US
+      email_suffix: outlook.com
+  count: 1
+
+  mailbox:
+    type: one_mail
+    options:
+      # Credential pool comes from ONEMAIL_EMAILS (address:password CSV);
+      # base_url from ONEMAIL_API_BASE. Set allow_autoreg: true only if you
+      # accept one-mail throwing away addresses (default off per vault).
+      allow_autoreg: false
+
+  decode:
+    type: one_mail
+    options:
+      timeout_s: 180
+      poll_interval_s: 3
+
+  strategy:
+    fail_fast: true
+    fail_fast_kinds:
+      - provider
+      - fatal
+      - proxy
+      - token
+      - registration_disallowed
+      - captcha
+    burn:
+      - ip
+      - proxy
+      - mailbox
+    egress:
+      mode: direct

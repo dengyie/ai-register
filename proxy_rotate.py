@@ -334,12 +334,56 @@ def clash_switch_node(
             pass
 
 
+def _filter_leaf_names(
+    proxies: dict[str, Any],
+    names: list[str],
+    *,
+    exclude_re: str,
+    include_re: str = "",
+) -> list[str]:
+    """Keep real proxy leaves. Groups, DIRECT/REJECT, and the exclude regex drop out."""
+    ex = re.compile(exclude_re) if exclude_re else None
+    inc = re.compile(include_re) if include_re else None
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        if ex and ex.search(name):
+            continue
+        if inc and not inc.search(name):
+            continue
+        meta = proxies.get(name) if isinstance(proxies.get(name), dict) else {}
+        # An allowlist name that is not a loaded leaf must not enter the pool.
+        # Donor fallback still accepts a name whose type the API did not return.
+        if not isinstance(meta, dict) or not meta:
+            continue
+        ntype = str(meta.get("type") or "")
+        if ntype in _SKIP_NODE_TYPES:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def _leaf_nodes_from_donor(
     proxies: dict[str, Any],
     donor_group: str,
     *,
     exclude_re: str,
+    include_re: str = "",
+    allowlist: list[str] | None = None,
 ) -> list[str]:
+    """Collect leaves for a new dedicated selector.
+
+    ``allowlist`` wins: only those exact names, and only if they are live
+    leaves. That is how a pool stays a known set (US, reachable, not
+    google-vps) instead of inheriting every member of the donor group.
+    """
+    if allowlist:
+        return _filter_leaf_names(
+            proxies, list(allowlist), exclude_re=exclude_re, include_re=""
+        )
     donor = proxies.get(donor_group) if isinstance(proxies.get(donor_group), dict) else None
     names: list[str] = []
     if donor and isinstance(donor.get("all"), list):
@@ -352,21 +396,9 @@ def _leaf_nodes_from_donor(
             if str(meta.get("type") or "") in _SKIP_NODE_TYPES:
                 continue
             names.append(name)
-    ex = re.compile(exclude_re) if exclude_re else None
-    out: list[str] = []
-    seen = set()
-    for name in names:
-        if not name or name in seen:
-            continue
-        if ex and ex.search(name):
-            continue
-        meta = proxies.get(name) if isinstance(proxies.get(name), dict) else {}
-        ntype = str((meta or {}).get("type") or "")
-        if ntype in _SKIP_NODE_TYPES:
-            continue
-        seen.add(name)
-        out.append(name)
-    return out
+    return _filter_leaf_names(
+        proxies, names, exclude_re=exclude_re, include_re=include_re
+    )
 
 
 def _yaml_quote(s: str) -> str:
@@ -423,16 +455,51 @@ def autodetect_verge_enhancement_files(
     return g, r
 
 
+def _group_member_names(text: str, group: str) -> list[str]:
+    """Member names of one selector, in file order. Empty when the group is absent."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*- name:\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        name = m.group(1).strip().strip("\"'")
+        if name == group:
+            start = i
+            break
+    if start is None:
+        return []
+    members: list[str] = []
+    in_proxies = False
+    for line in lines[start + 1 :]:
+        if re.match(r"^\s*- name:\s*", line) or (
+            line and not line.startswith(" ") and not line.startswith("-")
+        ):
+            break
+        if re.match(r"^\s+proxies:\s*$", line):
+            in_proxies = True
+            continue
+        if not in_proxies:
+            continue
+        m = re.match(r"^\s+- (.+?)\s*$", line)
+        if m:
+            members.append(m.group(1).strip().strip("\"'"))
+    return members
+
+
 def _inject_group_and_rules_into_runtime_yaml(
     config_path: Path,
     *,
     group: str,
     nodes: list[str],
     domains: list[str],
+    replace_members: bool = False,
 ) -> bool:
-    """Inject GROK-REG group + domain rules into clash-verge.yaml if missing.
+    """Inject a dedicated selector + domain rules into the clash runtime yaml.
 
-    Returns True if file was modified.
+    Returns True if the file was modified. An existing group is left alone
+    unless ``replace_members`` is set, which rewrites that group's member
+    list in place and does not touch any other selector.
     """
     path = config_path.expanduser()
     if not path.is_file():
@@ -442,6 +509,31 @@ def _inject_group_and_rules_into_runtime_yaml(
     group_marker = f"name: {group}"
     group_marker_q = f'name: "{group}"'
     has_group = (group_marker in text) or (group_marker_q in text)
+
+    if has_group and replace_members:
+        current = _group_member_names(text, group)
+        if current != list(nodes):
+            lines = text.splitlines(keepends=True)
+            start = None
+            for i, line in enumerate(lines):
+                m = re.match(r"^\s*- name:\s*(.+?)\s*$", line)
+                if m and m.group(1).strip().strip("\"'") == group:
+                    start = i
+                    break
+            if start is None:
+                raise RuntimeError(f"clash group marker present but block missing: {group}")
+            end = len(lines)
+            for j in range(start + 1, len(lines)):
+                line = lines[j]
+                if re.match(r"^\s*- name:\s*", line) or (
+                    line.strip() and not line.startswith(" ") and not line.startswith("-")
+                ):
+                    end = j
+                    break
+            block = _build_group_yaml(group, nodes)
+            if not block.endswith("\n"):
+                block += "\n"
+            text = "".join(lines[:start]) + block + "".join(lines[end:])
 
     if not has_group:
         block = _build_group_yaml(group, nodes)
@@ -522,6 +614,85 @@ def _write_verge_enhancement(
         pass
 
 
+def _inject_leaf_listeners_into_runtime_yaml(
+    config_path: Path,
+    *,
+    nodes: list[str],
+    base_port: int,
+    listen: str = "127.0.0.1",
+) -> tuple[bool, dict[str, str]]:
+    """Give each allowlisted leaf its own mixed-port listener.
+
+    A selector has one ``now``, so parallel workers on the shared mixed port
+    share one exit. One listener per leaf lets each in-flight attempt dial a
+    different node. Existing listeners are left in place; only a listener
+    whose name is ``reg-leaf-<port>`` is rewritten. Returns
+    ``(changed, {node_name: proxy_url})``.
+    """
+    path = config_path.expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"clash config not found: {path}")
+    if base_port < 1 or base_port > 65535:
+        raise ValueError(f"leaf listener base port out of range: {base_port}")
+    text = path.read_text(encoding="utf-8")
+    original = text
+    mapping: dict[str, str] = {}
+    blocks: list[str] = []
+    for i, name in enumerate(nodes):
+        port = base_port + i
+        if port > 65535:
+            raise ValueError(f"leaf listener port overflow at {name!r}")
+        mapping[name] = f"http://{listen}:{port}"
+        blocks.append(
+            "\n".join(
+                [
+                    f"- name: {_yaml_quote(f'reg-leaf-{port}')}",
+                    "  type: mixed",
+                    f"  port: {port}",
+                    f"  listen: {listen}",
+                    f"  proxy: {_yaml_quote(name)}",
+                ]
+            )
+        )
+    block = "\n".join(blocks) + "\n"
+    m = re.search(r"(?m)^listeners:\s*\n", text)
+    if m is None:
+        text = text.rstrip() + "\n\nlisteners:\n" + block
+    else:
+        # Drop previously managed leaf listeners, then prepend the new set.
+        lines = text.splitlines(keepends=True)
+        # recompute marker against split lines
+        start = None
+        for i, line in enumerate(lines):
+            if re.match(r"^listeners:\s*\n?$", line):
+                start = i
+                break
+        if start is None:
+            raise RuntimeError("listeners: marker missing after match")
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if lines[j] and not lines[j].startswith(" ") and not lines[j].startswith("-"):
+                end = j
+                break
+        kept: list[str] = []
+        i = start + 1
+        while i < end:
+            line = lines[i]
+            nm = re.match(r"^- name:\s*(.+?)\s*$", line)
+            if nm and nm.group(1).strip().strip("\"'").startswith("reg-leaf-"):
+                i += 1
+                while i < end and not re.match(r"^- \S", lines[i]):
+                    i += 1
+                continue
+            kept.append(line)
+            i += 1
+        text = "".join(lines[: start + 1]) + block + "".join(kept) + "".join(lines[end:])
+    if text == original:
+        return False, mapping
+    path.write_text(text, encoding="utf-8")
+    return True, mapping
+
+
 def clash_force_reload(api: str, config_path: str, *, secret: str = "", timeout: float = 15.0) -> None:
     path = str(Path(config_path).expanduser())
     status, body = clash_request(
@@ -545,24 +716,60 @@ def ensure_clash_domain_group(
     config_path: str,
     secret: str = "",
     exclude_re: str = _DEFAULT_CLASH_EXCLUDE,
+    include_re: str = "",
+    allowlist: list[str] | None = None,
+    leaf_base_port: int = 0,
     profiles_dir: str = "",
     verge_groups_file: str = "",
     verge_rules_file: str = "",
     log: LogFn = None,
 ) -> dict[str, Any]:
-    """Ensure dedicated selector + domain rules exist; reload if we patched YAML."""
+    """Ensure dedicated selector + domain rules exist; reload if we patched YAML.
+
+    ``allowlist`` (exact live leaf names) is the pool. When it is set, an
+    existing group whose members differ is rewritten to that list. Donor copy
+    is only the fallback for a group that does not exist yet.
+    """
     proxies = clash_get_proxies(api, secret=secret)
+    pinned = _leaf_nodes_from_donor(
+        proxies,
+        donor_group,
+        exclude_re=exclude_re,
+        include_re=include_re,
+        allowlist=allowlist,
+    ) if allowlist else []
+    if allowlist and not pinned:
+        raise RuntimeError(
+            f"allowlist 里没有仍在线的叶子节点，拒绝创建/改写 {group!r}"
+        )
     if group in proxies and str((proxies.get(group) or {}).get("type") or "") in _SELECTOR_TYPES:
         # still ensure domain rules present in runtime yaml
         nodes, now, _ = clash_list_nodes(
             api, group, secret=secret, exclude_re=exclude_re, proxies=proxies
         )
-        if not nodes:
+        if pinned:
+            nodes = pinned
+        elif not nodes:
             # group exists but empty — refill from donor
-            nodes = _leaf_nodes_from_donor(proxies, donor_group, exclude_re=exclude_re)
+            nodes = _leaf_nodes_from_donor(
+                proxies,
+                donor_group,
+                exclude_re=exclude_re,
+                include_re=include_re,
+            )
         changed = _inject_group_and_rules_into_runtime_yaml(
-            Path(config_path), group=group, nodes=nodes or ["DIRECT"], domains=domains
+            Path(config_path),
+            group=group,
+            nodes=nodes or ["DIRECT"],
+            domains=domains,
+            replace_members=bool(pinned),
         )
+        leaf_map: dict[str, str] = {}
+        if pinned and leaf_base_port:
+            leaf_changed, leaf_map = _inject_leaf_listeners_into_runtime_yaml(
+                Path(config_path), nodes=pinned, base_port=leaf_base_port
+            )
+            changed = changed or leaf_changed
         if changed:
             _log(log, f"[*] Clash 已补充域名规则 -> {group}，强制重载配置…")
             clash_force_reload(api, config_path, secret=secret)
@@ -573,9 +780,15 @@ def ensure_clash_domain_group(
             "nodes": len(nodes),
             "now": str((proxies.get(group) or {}).get("now") or now),
             "reloaded": changed,
+            "leaf_listeners": leaf_map,
         }
 
-    nodes = _leaf_nodes_from_donor(proxies, donor_group, exclude_re=exclude_re)
+    nodes = pinned or _leaf_nodes_from_donor(
+        proxies,
+        donor_group,
+        exclude_re=exclude_re,
+        include_re=include_re,
+    )
     if not nodes:
         raise RuntimeError(
             f"无法从策略组 {donor_group!r} 收集可用节点以创建 {group!r}"
@@ -597,6 +810,11 @@ def ensure_clash_domain_group(
             nodes=nodes,
             domains=domains,
         )
+    leaf_map: dict[str, str] = {}
+    if pinned and leaf_base_port:
+        _leaf_changed, leaf_map = _inject_leaf_listeners_into_runtime_yaml(
+            Path(config_path), nodes=pinned, base_port=leaf_base_port
+        )
     clash_force_reload(api, config_path, secret=secret)
     proxies2 = clash_get_proxies(api, secret=secret)
     if group not in proxies2:
@@ -609,6 +827,7 @@ def ensure_clash_domain_group(
         "nodes": len(nodes),
         "now": str((proxies2.get(group) or {}).get("now") or ""),
         "reloaded": True,
+        "leaf_listeners": leaf_map,
     }
 
 
@@ -637,6 +856,11 @@ class ProxyRotator:
         self.clash_verge_rules_file = ""
         self.clash_exclude = _DEFAULT_CLASH_EXCLUDE
         self.clash_include = ""
+        self.clash_allowlist: list[str] = []
+        self.clash_leaf_base_port = 0
+        self.leaf_listeners: dict[str, str] = {}
+        self._held_leaves: set[str] = set()
+        self._leaf_overflow = 0
         self.clash_flush = True
         self.clash_restore_on_exit = True
         self.clash_pin_node = ""
@@ -736,6 +960,20 @@ class ProxyRotator:
                 or _DEFAULT_CLASH_EXCLUDE
             )
             self.clash_include = str(cfg.get("clash_node_include") or "").strip()
+            raw_allow = cfg.get("clash_node_allowlist")
+            if raw_allow is None or raw_allow == "":
+                raw_allow = os.environ.get("CLASH_NODE_ALLOWLIST") or ""
+            if isinstance(raw_allow, (list, tuple)):
+                self.clash_allowlist = [str(x).strip() for x in raw_allow if str(x).strip()]
+            else:
+                self.clash_allowlist = parse_proxy_list(raw_allow)
+            raw_port = cfg.get("clash_leaf_base_port")
+            if raw_port is None or raw_port == "":
+                raw_port = os.environ.get("CLASH_LEAF_BASE_PORT") or ""
+            self.clash_leaf_base_port = _as_int(raw_port, 0) if str(raw_port).strip() else 0
+            self.leaf_listeners = {}
+            self._held_leaves = set()
+            self._leaf_overflow = 0
             self.clash_flush = _truthy(cfg.get("clash_flush_connections"), True)
             self.clash_restore_on_exit = _truthy(cfg.get("clash_restore_on_exit"), True)
             # Prefer config pin; fall back to GROK_NODE env (start-clash-for-grok.sh).
@@ -949,11 +1187,30 @@ class ProxyRotator:
             config_path=self.clash_config_path,
             secret=self.clash_secret,
             exclude_re=self.clash_exclude,
+            include_re=self.clash_include,
+            allowlist=self.clash_allowlist or None,
+            leaf_base_port=self.clash_leaf_base_port,
             profiles_dir=self.clash_profiles_dir,
             verge_groups_file=self.clash_verge_groups_file,
             verge_rules_file=self.clash_verge_rules_file,
             log=log,
         )
+        if self.clash_leaf_base_port and self.clash_allowlist:
+            # Re-read after reload: listener order follows the allowlist that
+            # survived the live-leaf filter inside ensure_clash_domain_group.
+            proxies_now = clash_get_proxies(
+                self.clash_api, secret=self.clash_secret
+            )
+            live = _leaf_nodes_from_donor(
+                proxies_now,
+                self.clash_donor_group,
+                exclude_re=self.clash_exclude,
+                allowlist=self.clash_allowlist,
+            )
+            self.leaf_listeners = {
+                name: f"http://127.0.0.1:{self.clash_leaf_base_port + i}"
+                for i, name in enumerate(live)
+            }
         self.clash_setup_done = True
         # snapshot original node of dedicated group only
         try:
@@ -1063,6 +1320,45 @@ class ProxyRotator:
         advance_on_start = bool(cfg and cfg.get("proxy_rotate_advance_on_start"))
         if not self._started and advance_on_start and not force_advance:
             _log(log, f"[*] advance_on_start: 首调用推进到下一节点(新 IP) pool={len(nodes)}")
+        # Per-leaf listeners: each in-flight attempt dials its own node, so
+        # parallel workers do not share the selector's single `now`.
+        if self.leaf_listeners:
+            free = [n for n in nodes if n in self.leaf_listeners and n not in self._held_leaves]
+            if free:
+                nxt_leaf = free[0]
+                self._leaf_overflow = 0
+            else:
+                # Every leaf is still held (or a hold leaked). Round-robin
+                # rather than pinning the rest of the batch to nodes[0].
+                # The first overflow pick is pool[1]: pool[0] is the one a
+                # leaked hold would otherwise keep forever.
+                pool = [n for n in nodes if n in self.leaf_listeners]
+                if pool:
+                    nxt_leaf = pool[(self._leaf_overflow + 1) % len(pool)]
+                    self._leaf_overflow += 1
+                else:
+                    nxt_leaf = ""
+            if nxt_leaf:
+                self._held_leaves.add(nxt_leaf)
+                url = self.leaf_listeners[nxt_leaf]
+                self.current_proxy = url
+                self.current_label = nxt_leaf
+                return {
+                    "rotated": True,
+                    "mode": "clash",
+                    "label": nxt_leaf,
+                    "node": nxt_leaf,
+                    "prev": now,
+                    "reason": "leaf_listener",
+                    "group": self.clash_group,
+                    "pool_size": len(self.leaf_listeners),
+                    "domains": list(self.clash_domains),
+                    "proxy": url,
+                    "scope": "leaf_listener",
+                    "will_restore": False,
+                    "original": self._original_clash_node,
+                }
+
         if not self._started and not force_advance and not advance_on_start:
             pin = self.clash_pin_node
             if pin and pin in nodes and pin != now:
@@ -1437,7 +1733,19 @@ def current_proxy_override() -> str:
     with _rotator._lock:
         if _rotator.mode == "list" and _rotator.current_proxy:
             return _rotator.current_proxy
+        # Leaf listeners are per-attempt. Reading the rotator's current_proxy
+        # here races: the next worker overwrites it before this one copies it.
+        # maybe_rotate already returned the URL for this attempt.
         return ""
+
+
+def release_leaf(node: str) -> None:
+    """Return a per-leaf listener to the free set after an attempt finishes."""
+    name = str(node or "").strip()
+    if not name:
+        return
+    with _rotator._lock:
+        _rotator._held_leaves.discard(name)
 
 
 def current_egress_label() -> str:

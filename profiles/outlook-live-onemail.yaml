@@ -1,0 +1,62 @@
+# Live profile: Outlook protocol registration + one-mail catch-all recovery.
+#
+# Auth channel: admin (x-admin-auth). one-mail's catch-all domains ingest every
+# prefix, so each run mints a UNIQUE random address (一号一箱 by entropy) and
+# reads codes via /api/unified/verifcodes — no address passwords needed
+# (ENABLE_ADDRESS_PASSWORD is off in production).
+#
+# Secrets stay in env, never in this file:
+#   export ONEMAIL_API_BASE="https://mail-api.mangoqwq.cc.cd"
+#   export ONEMAIL_ADMIN_KEY="<aggregator admin_token>"   # x-admin-auth value
+#   export ONEMAIL_DOMAINS="dengyie.tech"                  # catch-all domain(s)
+#   export CAPTCHA_RUN_BASE="http://10.144.144.8:8077"     # slidex (mesh)
+#   export CAPTCHA_RUN_KEY="<SLIDEX_CAPTCHA_KEYS value>"
+#   GROK_REGISTER_OUTLOOK_LIVE=1 \
+#   .venv/bin/python -m register_core run \
+#     --profile profiles/outlook-live-onemail.yaml --proxy "$PROXY" -n 1
+#
+# The egress proxy must be OUTSIDE-CN residential/clean IP (sign-up risk gate)
+# and must match the PX task proxy (same-IP iron law, docs/ANTIBAN.md).
+
+apiVersion: register.v1
+kind: RegisterProfile
+metadata:
+  name: outlook-live-onemail
+  description: Outlook protocol mode + one-mail catch-all admin channel
+
+spec:
+  provider:
+    name: outlook
+    options:
+      mode: protocol
+      mail_token_mode: graph
+      country: US
+      email_suffix: outlook.com
+  count: 1
+
+  mailbox:
+    type: one_mail
+    options:
+      auth_mode: admin
+      # domains/admin_key/base_url all from ONEMAIL_* env (see header).
+
+  decode:
+    type: one_mail
+    options:
+      timeout_s: 180
+      poll_interval_s: 3
+
+  strategy:
+    fail_fast: true
+    fail_fast_kinds:
+      - provider
+      - fatal
+      - proxy
+      - token
+      - registration_disallowed
+      - captcha
+    burn:
+      - ip
+      - proxy
+    egress:
+      mode: direct

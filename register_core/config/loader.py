@@ -100,6 +100,10 @@ def _check_secrets_policy(raw: dict[str, Any], *, mode: str, path: str) -> None:
                 # env *names* are ok: keys ending with _env or values that are env refs only
                 if str(k).endswith("_env"):
                     continue
+                # *_mode keys carry enum names (e.g. mail_token_mode: graph,
+                # captcha_mode: press), not credential material.
+                if str(k).endswith("_mode"):
+                    continue
                 if _SECRET_KEY_RE.search(str(k)):
                     if isinstance(v, str) and v.strip() and not str(k).endswith("_env"):
                         # allow empty / env:VAR form

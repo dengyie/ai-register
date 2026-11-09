@@ -35,6 +35,14 @@ from register_core.providers.outlook_oauth import OAuthStateMachine, OutlookOAut
 from register_core.providers.outlook_recovery import bind_recovery_email
 from register_core.providers.outlook_identity import resolve_egress_identity
 
+from providers.outlook.protocol import msa_flow
+from providers.outlook.protocol.constants import (
+    SIGNUP_DOMAINS,
+    TOKEN_MODES,
+    TOKEN_MODE_CLIENT_ID,
+    timezone_for_country,
+)
+
 # How long the headed browser stays open waiting for the operator to solve the
 # captcha by hand. FunCaptcha is a few clicks; 10 minutes is generous without
 # leaving a headed browser parked forever on an abandoned run.
@@ -70,6 +78,25 @@ class OutlookProvider:
 
     def __init__(self, *, config: dict[str, Any] | None = None, **options: Any) -> None:
         self.config = {**(config or {}), **options}
+        # mode: protocol = pure-HTTP MSA flow; browser = legacy headed-browser
+        # orchestration (DEFAULT — keeps existing behavior; protocol mode must
+        # be opted into explicitly via profile/env, e.g.
+        # profiles/outlook-protocol.example.yaml).
+        self._mode = str(self.config.get("mode") or "browser").strip().lower()
+        if self._mode not in ("protocol", "browser"):
+            raise ValueError(
+                f"outlook options.mode must be 'protocol' or 'browser', got {self._mode!r}"
+            )
+        # mail_token_mode: which mail OAuth scope the account's refresh token gets.
+        # graph = Graph REST read path (one-mail graph_outlook); login_exe =
+        # Thunderbird IMAP/POP/SMTP set (one-mail imap_outlook).
+        self._token_mode = str(self.config.get("mail_token_mode") or "graph").strip().lower()
+        if self._token_mode not in TOKEN_MODES:
+            raise ValueError(
+                f"outlook options.mail_token_mode must be one of {TOKEN_MODES}, "
+                f"got {self._token_mode!r}"
+            )
+        self._country = str(self.config.get("country") or "US").strip().upper()
         # The auths directory is taken from explicit config first; otherwise we
         # honor the same OUTLOOK_AUTHS_DIR env the supervisor count block and the
         # control-api list route use, so write/count/list stay aligned on one
@@ -92,6 +119,10 @@ class OutlookProvider:
                 error_kind="provider",
                 secret_kind="none",
             )
+        if self._mode == "protocol":
+            # msa_flow.register_one swallows every exception into a SignupResult;
+            # there is no raise path here to catch (browser path below has one).
+            return self._register_one_protocol(extra=extra or {})
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -166,6 +197,94 @@ class OutlookProvider:
         if isinstance(raw, str) and raw.strip() and raw in text:
             cleaned = cleaned.replace(raw, "<redacted-proxy>")
         return cleaned
+
+    # ---------------- protocol mode (pure HTTP, no browser) ----------------
+
+    def _resolve_sms_provider(self) -> Any:
+        """Phone-gate (1312) SMS source: options key first, then env.
+
+        ``options.sms_provider`` = "env" (default) resolves via
+        ``sms_client.create_sms_provider()`` — OUTLOOK_SMS_API_KEY et al.
+        Any other truthy string is reserved for future direct provider
+        configs; empty/None disables the gate pass (current behaviour).
+        """
+        option = str(self.config.get("sms_provider") or "env").strip().lower()
+        if option != "env":
+            return None
+        try:
+            from providers.outlook.protocol.sms_client import create_sms_provider
+
+            return create_sms_provider()
+        except Exception:  # noqa: BLE001 — SMS source must never break signup
+            return None
+
+    def _register_one_protocol(self, *, extra: dict[str, Any]) -> RegisterResult:
+        """Pure-HTTP MSA registration → 0600 artifact (→ pool replenish loop).
+
+        The proxy handoff boundary matches the browser path: only
+        pipeline-injected extra["proxy"], never env discovery. The flow itself
+        lives in providers/outlook/protocol/msa_flow.register_one; this wrapper
+        owns result mapping, artifact persistence, and proxy-credential hygiene.
+        """
+        raw_proxy = extra.get("proxy")
+        if not isinstance(raw_proxy, str) or not raw_proxy.strip():
+            return RegisterResult(
+                ok=False,
+                provider=self.name,
+                error="missing attempt proxy",
+                error_kind="proxy",
+                secret_kind="none",
+            )
+        proxy = raw_proxy.strip()
+        domain = str(self.config.get("email_suffix") or "outlook.com").lstrip("@")
+        if domain not in SIGNUP_DOMAINS:
+            domain = "outlook.com"
+
+        result = msa_flow.register_one(
+            proxy=proxy,
+            domain=domain,
+            country=self._country,
+            token_mode=self._token_mode,
+            log=lambda msg: print(f"[outlook-protocol] {msg}", flush=True),
+            sms_provider=self._resolve_sms_provider(),
+        )
+        artifacts = {
+            "mode": "protocol",
+            "mail_token_mode": self._token_mode,
+            "outlook_steps": sorted(result.steps.keys()),
+        }
+        if not result.ok:
+            artifacts["fail_step"] = result.fail_step
+            return RegisterResult(
+                ok=False,
+                provider=self.name,
+                email=result.email or "",
+                error=self._scrub_proxy_creds(result.error or result.error_kind, extra),
+                error_kind=normalize_error_kind(result.error_kind or "provider"),
+                secret_kind="none",
+                artifacts=artifacts,
+            )
+
+        client_id = TOKEN_MODE_CLIENT_ID[self._token_mode]
+        artifact_path = self._write_outlook_artifact(
+            email=result.email,
+            password=result.password,
+            client_id=client_id,
+            refresh_token=result.refresh_token,
+            recovery_email="",
+            bound=False,
+            created_at=datetime.now(timezone.utc),
+        )
+        artifacts["outlook_auth_path"] = artifact_path
+        return RegisterResult(
+            ok=True,
+            provider=self.name,
+            email=result.email,
+            password=result.password,
+            secret=result.refresh_token,
+            secret_kind="refresh_token",
+            artifacts=artifacts,
+        )
 
     def _captcha_bridge(self) -> OutlookCaptchaBridge:
         """Injectable bridge seam for orchestration."""

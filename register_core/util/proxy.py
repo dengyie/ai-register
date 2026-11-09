@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from pathlib import Path
 from typing import Any, Callable
 
 from register_core.util.egress import (
@@ -27,6 +29,38 @@ log = logging.getLogger("register_core.util.proxy")
 LogFn = Callable[[str], None] | None
 
 _CONFIGURED = False
+
+
+def _read_clash_secret() -> str:
+    """Controller secret for standalone mihomo. Never log the return value.
+
+    pxed keeps it in the live config (``secret:``), not in the process env.
+    A dedicated file wins over parsing the yaml.
+    """
+    for raw in (
+        os.environ.get("CLASH_SECRET_FILE") or "",
+        "/personal/clash/.controller-secret",
+    ):
+        path = raw.strip()
+        if not path:
+            continue
+        try:
+            text = Path(path).expanduser().read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text:
+            return text
+    cfg = (
+        os.environ.get("CLASH_CONFIG_PATH")
+        or os.environ.get("CLASH_CONFIG")
+        or "/personal/clash/config.yaml"
+    )
+    try:
+        body = Path(cfg).expanduser().read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = re.search(r'(?m)^secret:\s*["\']?([^"\'\s#]+)', body)
+    return m.group(1).strip() if m else ""
 
 
 def _env_first(*names: str, default: str = "") -> str:
@@ -273,13 +307,31 @@ def rotation_config_from_env_and_extra(extra: dict[str, Any] | None = None) -> d
 
     if mode == "clash" or backend == "clash":
         cfg["clash_api"] = _env_first("CLASH_API", "CLASH_CONTROLLER") or None
-        cfg["clash_secret"] = _env_first("CLASH_SECRET")
+        cfg["clash_secret"] = _env_first("CLASH_SECRET") or _read_clash_secret() or None
         cfg["clash_proxy_group"] = _env_first("CLASH_GROUP", "CLASH_PROXY_GROUP") or None
         cfg["clash_rule_domains"] = (
             extra.get("clash_rule_domains")
             or _env_first("CLASH_DOMAINS", "CLASH_RULE_DOMAINS")
             or None
         )
+        cfg["clash_node_allowlist"] = (
+            extra.get("clash_node_allowlist")
+            or _env_first("CLASH_NODE_ALLOWLIST")
+            or None
+        )
+        cfg["clash_donor_group"] = (
+            extra.get("clash_donor_group")
+            or _env_first("CLASH_DONOR_GROUP")
+            or None
+        )
+        raw_leaf_port = extra.get("clash_leaf_base_port")
+        if raw_leaf_port is None or raw_leaf_port == "":
+            raw_leaf_port = _env_first("CLASH_LEAF_BASE_PORT")
+        if str(raw_leaf_port or "").strip():
+            try:
+                cfg["clash_leaf_base_port"] = int(raw_leaf_port)
+            except (TypeError, ValueError):
+                pass
         # pxed: standalone mihomo reads /personal/clash/config.yaml, not Clash
         # Verge. Without this the rotator falls back to the macOS Verge path and
         # ensure_clash_domain_group raises FileNotFoundError -> rotation silently
@@ -325,9 +377,32 @@ def configure_rotation_once(
 
 
 def reset_rotation_for_tests() -> None:
-    """Test helper: allow re-configure in the same process."""
+    """Test helper: allow re-configure in the same process.
+
+    Also resets the proxy_rotate singleton so a previous test's list/clash
+    configuration (mode, current_proxy, leaf claims) cannot leak into the
+    next test through the module-level ``_rotator``.
+    """
     global _CONFIGURED
     _CONFIGURED = False
+    _egress_ip_cache.clear()
+    try:
+        from proxy_rotate import get_rotator
+
+        rotator = get_rotator()
+        with rotator._lock:
+            rotator.mode = "off"
+            rotator.current_proxy = ""
+            rotator.current_label = ""
+            rotator.list_pool = []
+            rotator.list_index = 0
+            rotator.leaf_listeners = {}
+            rotator._held_leaves = set()
+            rotator._mint_holds = {}
+            rotator._mint_hold_since = {}
+    except Exception:
+        # Best-effort: proxy_rotate may not be importable in minimal contexts.
+        pass
 
 
 def resolve_attempt_proxy(
@@ -348,6 +423,10 @@ def resolve_attempt_proxy(
         }
 
     override = (current_proxy_override() or "").strip()
+    if not override and isinstance(info, dict):
+        # Per-leaf claim: the URL belongs to this call, not to rotator state.
+        if info.get("reason") == "leaf_listener":
+            override = str(info.get("proxy") or "").strip()
     if override:
         return override, info
 
@@ -392,12 +471,54 @@ def inject_attempt_proxy(extra: dict[str, Any] | None = None, *, log_fn: LogFn =
                 "group",
                 "error",
                 "scope",
+                "reason",
+                "node",
                 "egress_backend",
                 "egress_source",
             )
             if k in info
         }
+    # StrategyEngine burn [ip] reads extra["_egress_ip"]; without a writer the
+    # ip dimension of burn/cool is a silent no-op. Cached per proxy URL so the
+    # probe costs one outbound GET per egress change, not per attempt.
+    egress_ip = _cached_egress_ip(proxy, log_fn=log_fn)
+    if egress_ip:
+        base["_egress_ip"] = egress_ip
     return base
+
+
+# proxy URL → (ip, monotonic ts). TTL keeps repeated attempts on the same
+# sticky egress probe-free while still noticing rotations within minutes.
+_EGRESS_IP_TTL_S = 600.0
+_egress_ip_cache: dict[str, tuple[str, float]] = {}
+
+
+def reset_egress_ip_cache_for_tests() -> None:
+    _egress_ip_cache.clear()
+
+
+def _cached_egress_ip(proxy: str, *, log_fn: LogFn = None) -> str:
+    """Public egress IP for this proxy, TTL-cached; "" on any failure."""
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return ""
+    import time as _time
+
+    now = _time.monotonic()
+    hit = _egress_ip_cache.get(proxy)
+    if hit and now - hit[1] < _EGRESS_IP_TTL_S:
+        return hit[0]
+    try:
+        from register_core.nodes.health import probe_egress_ip
+
+        result = probe_egress_ip(proxy, timeout=10.0)
+        ip = str(result.get("ip") or "") if result.get("ok") else ""
+    except Exception as exc:
+        if log_fn is not None:
+            log_fn(f"[egress] ip probe failed (burn-ip degraded): {exc}")
+        ip = ""
+    _egress_ip_cache[proxy] = (ip, now)
+    return ip
 
 
 def _env_truthy_name(*names: str, default: bool = False) -> bool:
