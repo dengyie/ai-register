@@ -9,10 +9,21 @@ clash — **domain-scoped Clash rotation** (recommended with local 7897):
         ensure a dedicated selector group (default ``GROK-REG``) + DOMAIN-SUFFIX
         rules for xAI/Grok hosts pointing at that group; rotate **only that
         group's node**. Never touch the main profile selector (e.g. 宝可梦).
+tetherpool — **TetherPool (IP-Pool) anti-sybil lease mode** (每号新租约):
+        per-account ``GET /v1/acquire_for_registration`` lease (tier=premium,
+        anti-sybil IP cooldown against reuse within ``tetherpool_cooldown``),
+        Chromium/HTTP/mint all ride the ``:9101`` parametric gateway URL for the
+        SAME account_id (shared ``leases`` table ⇒ exact sticky binding).
+        Fail-fast may report ``/v1/battery/event`` so the pool's circuit breaker
+        reacts. Control-plane outage ⇒ fall back to ``tetherpool_fallback_proxy``
+        (or ``proxy``) and keep going. Defaults: api/gateway on mesh
+        ``10.144.144.9`` (env ``TETHERPOOL_API_BASE`` / ``TETHERPOOL_GATEWAY_BASE``).
 
 Whole-machine impact
 --------------------
 - list: none outside register browser / its HTTP clients
+- tetherpool: none outside register browser / its HTTP clients (gateway is a
+  remote forward proxy; nothing local is switched)
 - clash: only traffic matching the injected domain rules uses the rotated node
   (TUN/system-proxy clients hitting those domains share it; everything else
   keeps the original policy group). On process exit we restore the GROK-REG
@@ -885,6 +896,21 @@ class ProxyRotator:
         # the scored-pick block can soft-prefer a node with a known good pair.
         # Empty when EMAIL_IP_CORRELATION is off or no registration running.
         self._registration_domain: str = ""
+        # TetherPool (IP-Pool) mode state: per-account anti-sybil lease via
+        # GET /v1/acquire_for_registration + :9101 parametric gateway riding the
+        # shared `leases` table. Control-plane outage falls back to static proxy.
+        self.tp_api_base = ""
+        self.tp_gateway_base = ""
+        self.tp_target_service = "grok_reg"
+        self.tp_tier = "premium"
+        self.tp_region = ""
+        self.tp_cooldown = 1800
+        self.tp_fallback_proxy = ""
+        self.tp_timeout = 15.0
+        self.tp_client: Any = None
+        self.tp_account_seq = 0
+        self._tp_current_account = ""
+        self._tp_node = ""
 
     def configure(self, cfg: dict | None) -> None:
         cfg = cfg if isinstance(cfg, dict) else {}
@@ -895,11 +921,13 @@ class ProxyRotator:
             # aliases
             if mode in {"clash_domain", "domain", "rules"}:
                 mode = "clash"
-            if mode not in {"off", "list", "clash"}:
+            if mode in {"tether", "tetherpool", "ip_pool", "ippool"}:
+                mode = "tetherpool"
+            if mode not in {"off", "list", "clash", "tetherpool"}:
                 mode = "off"
             self.mode = mode
             self.every = max(1, _as_int(cfg.get("proxy_rotate_every"), 1))
-            default_on_start = mode in {"list", "clash"}
+            default_on_start = mode in {"list", "clash", "tetherpool"}
             self.rotate_on_start = _truthy(
                 cfg.get("proxy_rotate_on_start"), default=default_on_start
             )
@@ -919,6 +947,50 @@ class ProxyRotator:
             self.current_label = (
                 proxy_log_label(self.current_proxy) or self.current_proxy or "(none)"
             )
+
+            # TetherPool mode config (env-overridable for prod hosts without config edits)
+            self.tp_api_base = str(
+                cfg.get("tetherpool_api_base")
+                or os.environ.get("TETHERPOOL_API_BASE")
+                or "http://10.144.144.9:9100"
+            ).strip().rstrip("/")
+            self.tp_gateway_base = str(
+                cfg.get("tetherpool_gateway_base")
+                or os.environ.get("TETHERPOOL_GATEWAY_BASE")
+                or "http://10.144.144.9:9101"
+            ).strip().rstrip("/")
+            self.tp_target_service = str(
+                cfg.get("tetherpool_target_service")
+                or os.environ.get("TETHERPOOL_TARGET_SERVICE")
+                or "grok_reg"
+            ).strip() or "grok_reg"
+            self.tp_tier = str(
+                cfg.get("tetherpool_tier")
+                or os.environ.get("TETHERPOOL_TIER")
+                or "premium"
+            ).strip() or "premium"
+            self.tp_region = str(
+                cfg.get("tetherpool_region")
+                or os.environ.get("TETHERPOOL_REGION")
+                or ""
+            ).strip()
+            self.tp_cooldown = max(
+                0, _as_int(cfg.get("tetherpool_cooldown"), _as_int(os.environ.get("TETHERPOOL_COOLDOWN"), 1800))
+            )
+            self.tp_fallback_proxy = str(
+                cfg.get("tetherpool_fallback_proxy")
+                or base_proxy
+                or (pool[0] if pool else "")
+            ).strip()
+            self.tp_timeout = max(
+                1.0, float(cfg.get("tetherpool_timeout") or os.environ.get("TETHERPOOL_TIMEOUT") or 15.0)
+            )
+            self.tp_client = None
+            self.tp_account_seq = 0
+            if mode == "tetherpool" and not self.tp_fallback_proxy:
+                raise RuntimeError(
+                    "proxy_rotate_mode=tetherpool 需要 tetherpool_fallback_proxy 或 proxy 作为控制面不可达时的回退出口"
+                )
 
             self.clash_api = str(
                 cfg.get("clash_api") or cfg.get("clash_controller") or DEFAULT_CLASH_API
@@ -998,7 +1070,7 @@ class ProxyRotator:
     def apply_to_config(self, cfg: dict) -> None:
         if not isinstance(cfg, dict):
             return
-        if self.mode != "list":
+        if self.mode not in {"list", "tetherpool"}:
             return
         proxy = self.current_proxy
         if not proxy:
@@ -1021,6 +1093,13 @@ class ProxyRotator:
                 "current_proxy": proxy_log_label(self.current_proxy) or self.current_proxy,
                 "current_label": self.current_label,
                 "list_size": len(self.list_pool),
+                "tp_api_base": self.tp_api_base,
+                "tp_gateway_base": self.tp_gateway_base,
+                "tp_tier": self.tp_tier,
+                "tp_target_service": self.tp_target_service,
+                "tp_cooldown": self.tp_cooldown,
+                "tp_current_account": self._tp_current_account,
+                "tp_node": self._tp_node,
                 "clash_api": self.clash_api,
                 "clash_group": self.clash_group,
                 "clash_donor_group": self.clash_donor_group,
@@ -1225,6 +1304,122 @@ class ProxyRotator:
                 self._original_clash_node = now
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # TetherPool (IP-Pool) mode: per-account anti-sybil lease + gateway ride
+    # ------------------------------------------------------------------
+
+    def _tp_client_locked(self) -> Any:
+        """Lazily construct the vendored zero-dep TetherPool SDK client."""
+        if self.tp_client is None:
+            try:
+                from vendor.tetherpool_client import TetherPoolClient as _TPC
+            except Exception as exc:  # pragma: no cover - vendor missing
+                raise RuntimeError(f"TetherPool SDK 加载失败: {exc}") from exc
+            self.tp_client = _TPC(
+                api_base=self.tp_api_base,
+                gateway_base=self.tp_gateway_base,
+                timeout=self.tp_timeout,
+            )
+        return self.tp_client
+
+    def _tp_gateway_url_locked(self, account_id: str) -> str:
+        """Gateway URL that rides the shared leases-table binding for account_id.
+
+        Deliberately carries NO type/tier/region tags: a tag that fails the
+        stored binding's constraint check would make the gateway fall back to an
+        ephemeral CRC32 re-selection instead of the registration lease.
+        """
+        client = self._tp_client_locked()
+        return client.get_gateway_proxy_url(
+            account_id,
+            egress_type=None,
+            region=None,
+            service=self.tp_target_service,
+            tier=None,
+            tier_policy=None,
+        )
+
+    def _rotate_tetherpool_locked(self, cfg: dict | None = None) -> dict[str, Any]:
+        client = self._tp_client_locked()
+        self.tp_account_seq += 1
+        account_id = f"grokreg-{int(time.time())}-{self.tp_account_seq}"
+        try:
+            lease = client.acquire_for_registration(
+                account_id=account_id,
+                target_service=self.tp_target_service,
+                cooldown=self.tp_cooldown,
+                region=self.tp_region or None,
+                egress_type=None,
+                tier=self.tp_tier,
+            )
+        except Exception as exc:
+            # Control-plane outage: fall back to the static proxy instead of
+            # killing the batch (opencode2api Mode B same-shape fallback).
+            self._last_error = str(exc)
+            self._tp_current_account = ""
+            self._tp_node = ""
+            proxy = self.tp_fallback_proxy
+            self.current_proxy = proxy
+            self.current_label = f"tp-fallback({proxy_log_label(proxy) or proxy})"
+            return {
+                "rotated": False,
+                "mode": "tetherpool",
+                "proxy": proxy,
+                "label": self.current_label,
+                "account_id": "",
+                "error": str(exc),
+                "fallback": True,
+                "scope": "browser_only",
+            }
+        self._last_error = ""
+        proxy = self._tp_gateway_url_locked(lease["account_id"])
+        self.current_proxy = proxy
+        self.current_label = (
+            f"tp:{lease.get('node_name')}({lease.get('exit_ip') or '?'})"
+        )
+        self._tp_current_account = str(lease["account_id"])
+        self._tp_node = str(lease.get("node_name") or "")
+        return {
+            "rotated": True,
+            "mode": "tetherpool",
+            "proxy": proxy,
+            "label": self.current_label,
+            "account_id": lease["account_id"],
+            "node": lease.get("node_name") or "",
+            "exit_ip": lease.get("exit_ip") or "",
+            "pool_size": None,
+            "prev": self.current_label,
+            "scope": "browser_only",
+        }
+
+    def report_tetherpool_battery(self, error_type: str, log: LogFn = None) -> dict[str, Any]:
+        """Report a reg fail-fast (browser_boot / connection dead / 429) upstream.
+
+        Forces the CURRENT account's sticky binding off the failed node; the next
+        maybe_rotate(force=True) acquires a fresh registration lease anyway, so this
+        exists to keep the pool's circuit breaker informed (供给归池边界).
+        Safe no-op outside tetherpool mode or without an active lease account.
+        """
+        with self._lock:
+            if self.mode != "tetherpool":
+                return {"ok": False, "reason": f"mode={self.mode}"}
+            account_id = getattr(self, "_tp_current_account", "")
+        if not account_id:
+            return {"ok": False, "reason": "no_active_account"}
+        try:
+            with self._lock:
+                client = self._tp_client_locked()
+            client.report_battery_error(
+                account_id=account_id,
+                error_type=error_type,
+                service=self.tp_target_service,
+                force_rebind=True,
+            )
+            return {"ok": True, "account_id": account_id}
+        except Exception as exc:
+            _log(log, f"[!] tetherpool battery event skip: {exc}")
+            return {"ok": False, "reason": str(exc)}
 
     def _rotate_list_locked(self, cfg: dict | None = None) -> dict[str, Any]:
         if not self.list_pool:
@@ -1581,6 +1776,8 @@ class ProxyRotator:
             try:
                 if self.mode == "list":
                     result = self._rotate_list_locked(cfg=config)
+                elif self.mode == "tetherpool":
+                    result = self._rotate_tetherpool_locked(cfg=config)
                 else:
                     # force=True (fail-fast): advance even on first call / same every window
                     result = self._rotate_clash_locked(
@@ -1603,7 +1800,7 @@ class ProxyRotator:
 
             self._started = True
             self.accounts_on_current = 1
-            if config is not None and self.mode == "list":
+            if config is not None and self.mode in {"list", "tetherpool"}:
                 self.apply_to_config(config)
             if result.get("rotated"):
                 if result.get("mode") == "clash":
@@ -1685,6 +1882,14 @@ def configure_proxy_rotation(cfg: dict | None, log: LogFn = None) -> ProxyRotato
                 f"[*] 代理轮换已启用(仅注册浏览器): mode=list every={st['every']} "
                 f"pool={st['list_size']} current={st['current_label'] or '-'}",
             )
+        elif st["mode"] == "tetherpool":
+            _log(
+                log,
+                f"[*] 代理轮换已启用(TetherPool 反女巫租约): mode=tetherpool every={st['every']} "
+                f"api={st['tp_api_base']} gateway={st['tp_gateway_base']} "
+                f"tier={st['tp_tier']} service={st['tp_target_service']} "
+                f"cooldown={st['tp_cooldown']}s fallback={st['current_label'] or '-'}",
+            )
         elif st["mode"] == "clash":
             _log(
                 log,
@@ -1731,7 +1936,7 @@ def restore_proxy_rotation(log: LogFn = None) -> bool:
 
 def current_proxy_override() -> str:
     with _rotator._lock:
-        if _rotator.mode == "list" and _rotator.current_proxy:
+        if _rotator.mode in {"list", "tetherpool"} and _rotator.current_proxy:
             return _rotator.current_proxy
         # Leaf listeners are per-attempt. Reading the rotator's current_proxy
         # here races: the next worker overwrites it before this one copies it.
@@ -1753,7 +1958,7 @@ def current_egress_label() -> str:
     with _rotator._lock:
         if _rotator.mode == "clash":
             return str(_rotator.current_label or "").strip()
-        if _rotator.mode == "list":
+        if _rotator.mode in {"list", "tetherpool"}:
             return (
                 proxy_log_label(_rotator.current_proxy)
                 or _rotator.current_label
@@ -1771,6 +1976,11 @@ def acquire_mint_egress(node: str, log: LogFn = None) -> dict[str, Any]:
 def release_mint_egress(node: str, log: LogFn = None) -> dict[str, Any]:
     """Release one mint leaf hold after mint finishes (ok or fail)."""
     return _rotator.release_mint_egress(node, log=log)
+
+
+def report_tetherpool_battery(error_type: str, log: LogFn = None) -> dict[str, Any]:
+    """Report a reg fail-fast upstream to TetherPool (mode=tetherpool only)."""
+    return _rotator.report_tetherpool_battery(error_type, log=log)
 
 
 def note_egress_outcome(
