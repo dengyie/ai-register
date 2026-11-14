@@ -150,14 +150,16 @@ def test_list_rotate_hard_recycles_browser() -> None:
     src = (ROOT / "register_cli.py").read_text(encoding="utf-8")
     assert "def _ensure_browser" in src
     assert 'rotate_result.get("rotated")' in src or "rotate_result.get('rotated')" in src
-    assert '== "list"' in src or "== 'list'" in src
-    assert "list 代理已轮换" in src
+    # 8388dcd 起硬回收覆盖 list + tetherpool 两种重写 --proxy-server 的模式
+    # （clash 只切叶子节点 soft OK），断言对齐集合写法。
+    assert 'mode in {"list", "tetherpool"}' in src
+    assert "代理已轮换" in src
     assert "reg.stop_browser()" in src
     # must sit inside _ensure_browser path (not only elsewhere)
     idx = src.find("def _ensure_browser")
     assert idx >= 0
     chunk = src[idx : idx + 2500]
-    assert "list 代理已轮换" in chunk
+    assert "代理已轮换" in chunk
     assert "stop_browser" in chunk
     print("PASS  list rotate hard-recycles browser in _ensure_browser")
 
