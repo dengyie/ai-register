@@ -965,11 +965,10 @@ class ProxyRotator:
                 or os.environ.get("TETHERPOOL_TARGET_SERVICE")
                 or "grok_reg"
             ).strip() or "grok_reg"
-            self.tp_tier = str(
-                cfg.get("tetherpool_tier")
-                or os.environ.get("TETHERPOOL_TIER")
-                or "premium"
-            ).strip() or "premium"
+            _tier_raw = cfg.get("tetherpool_tier", os.environ.get("TETHERPOOL_TIER"))
+            # "" (explicitly cleared in config) means "any tier" — must NOT
+            # fall back to premium, or warp (standard) pools stay unreachable.
+            self.tp_tier = str(_tier_raw).strip() if _tier_raw is not None else "premium"
             self.tp_region = str(
                 cfg.get("tetherpool_region")
                 or os.environ.get("TETHERPOOL_REGION")
@@ -1346,6 +1345,42 @@ class ProxyRotator:
             tier_policy=None,
         )
 
+    def _tp_warm_binding_locked(self, account_id: str, attempts: int = 3) -> bool:
+        """Warm a fresh lease's gateway binding before a browser rides it.
+
+        Observed on TetherPool gateway (:9101): the FIRST request through a
+        newly-bound account_id frequently dies mid-TLS (curl exit 000 /
+        ERR_CONNECTION_CLOSED) while the SAME account_id succeeds from the
+        second request onward (20/20 verified). A browser that boots straight
+        onto a cold binding therefore lands on a Chrome error page and the
+        registerer's fail-fast loop burns the lease instead of retrying it.
+
+        Warm-up: HTTP HEAD to a cheap, always-200 endpoint through the gateway
+        until it answers once (or attempts exhausted). Best-effort — a failure
+        here must not block rotation.
+        """
+        try:
+            import urllib.request
+
+            proxy = self._tp_gateway_url_locked(account_id)
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            req = urllib.request.Request(
+                "https://www.bing.com/favicon.ico",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            for _ in range(attempts):
+                try:
+                    with opener.open(req, timeout=10) as resp:
+                        if resp.status == 200:
+                            return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False  # warm-up is best-effort; never block rotation
+
     def _rotate_tetherpool_locked(self, cfg: dict | None = None) -> dict[str, Any]:
         client = self._tp_client_locked()
         self.tp_account_seq += 1
@@ -1379,6 +1414,7 @@ class ProxyRotator:
                 "scope": "browser_only",
             }
         self._last_error = ""
+        self._tp_warm_binding_locked(str(lease["account_id"]))
         proxy = self._tp_gateway_url_locked(lease["account_id"])
         self.current_proxy = proxy
         self.current_label = (
