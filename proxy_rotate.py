@@ -904,6 +904,7 @@ class ProxyRotator:
         self.tp_target_service = "grok_reg"
         self.tp_tier = "premium"
         self.tp_region = ""
+        self.tp_egress_type = ""  # cfg tetherpool_egress_type | env TETHERPOOL_EGRESS_TYPE; e.g. native_ipv4 to skip bridge pools
         self.tp_cooldown = 1800
         self.tp_fallback_proxy = ""
         self.tp_timeout = 15.0
@@ -972,6 +973,11 @@ class ProxyRotator:
             self.tp_region = str(
                 cfg.get("tetherpool_region")
                 or os.environ.get("TETHERPOOL_REGION")
+                or ""
+            ).strip()
+            self.tp_egress_type = str(
+                cfg.get("tetherpool_egress_type")
+                or os.environ.get("TETHERPOOL_EGRESS_TYPE")
                 or ""
             ).strip()
             self.tp_cooldown = max(
@@ -1350,7 +1356,7 @@ class ProxyRotator:
                 target_service=self.tp_target_service,
                 cooldown=self.tp_cooldown,
                 region=self.tp_region or None,
-                egress_type=None,
+                egress_type=self.tp_egress_type or None,
                 tier=self.tp_tier,
             )
         except Exception as exc:
