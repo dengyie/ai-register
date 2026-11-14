@@ -840,16 +840,16 @@ def _ensure_browser(worker_id: int, force_recycle: bool = False):
     except Exception as exc:
         log(worker_id, f"[!] 代理轮换失败(继续用当前出口): {exc}")
         rotate_result = {}
-    # list mode rewrites config.proxy into Chromium --proxy-server; a live browser
-    # still holds the old flag → hard-stop so start_browser rebuilds options.
+    # list/tetherpool mode rewrite config.proxy into Chromium --proxy-server; a live
+    # browser still holds the old flag → hard-stop so start_browser rebuilds options.
     # clash mode keeps mixed-port 127.0.0.1:7897 and only switches the leaf — soft OK.
     mode = str((rotate_result or {}).get("mode") or "").strip().lower()
     if (
-        mode == "list"
+        mode in {"list", "tetherpool"}
         and bool(rotate_result.get("rotated"))
         and reg.TabPool.get_browser() is not None
     ):
-        log(worker_id, "[*] list 代理已轮换，硬回收浏览器以绑定新 --proxy-server")
+        log(worker_id, f"[*] {mode} 代理已轮换，硬回收浏览器以绑定新 --proxy-server")
         try:
             reg.stop_browser()
         except Exception:
@@ -1070,6 +1070,17 @@ def _force_rotate_path(worker_id: int, reason: str) -> dict:
                 log=lambda m: log(worker_id, m),
                 config=getattr(reg, "config", None),
             )
+    except Exception:
+        pass
+    # tetherpool mode: feed the fail-fast upstream so the pool's circuit breaker
+    # demotes the failed exit (supply-side boundary; reg judgment stays local).
+    try:
+        from proxy_rotate import report_tetherpool_battery as _tp_battery
+
+        _tp_battery(
+            "turnstile" if "turnstile" in str(reason or "").lower() else "browser_boot",
+            log=lambda m: log(worker_id, m),
+        )
     except Exception:
         pass
     try:
@@ -2152,10 +2163,12 @@ def main() -> int:
     parser.add_argument("--no-headless", action="store_true", help="强制有头浏览器")
     parser.add_argument(
         "--proxy-rotate",
-        choices=("off", "list", "clash"),
+        choices=("off", "list", "clash", "tetherpool"),
         default="",
         help="代理/出口 IP 轮换：off=不轮换；list=轮换 proxy_list(仅注册浏览器)；"
-        "clash=在 Clash 专用策略组 GROK-REG 上轮换(域名规则命中才走该组，主策略组不动)",
+        "clash=在 Clash 专用策略组 GROK-REG 上轮换(域名规则命中才走该组，主策略组不动)；"
+        "tetherpool=TetherPool 反女巫租约(每号 /v1/acquire_for_registration premium 租约，"
+        ":9101 网关同 account_id 骑绑定)",
     )
     parser.add_argument(
         "--proxy-rotate-every",
