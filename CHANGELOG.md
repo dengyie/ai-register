@@ -9,6 +9,27 @@ project versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **通用 Cloudflare 盾求解层 `register_core/cf_solver.py`**：接入 slidex
+  打码站（captcha.run 兼容 v2 协议）新增的 `turnstile` / `cf_clearance`
+  任务类型。`solve_turnstile_token()` 返回 token，
+  `solve_cf_clearance()` 返回绑定了出口 IP + UA 的 `CFClearanceResult`。
+  站点默认走自建主站 `10.144.144.9:8077`，连接失败自动切冷备
+  `10.144.144.88:8077`（`CAPTCHA_RUN_BASE` / `CF_SOLVER_BASE` 可覆盖）；
+  key 走 `CAPTCHA_RUN_KEY`。**同出口 IP 铁律**：调用方必须传注册浏览器
+  同一条上游代理串（带凭据），不是本地代理桥。失败分类：求解侧失败 →
+  `kind="captcha"`（永不隔离出口 IP，与 `util/proxy.py` 既有语义一致）、
+  传输失败 → `kind="network"`；401 确定性不可重试。
+- **grok 遗留路径主动求解接线（默认关闭）**：`getTurnstileToken()` 开头新增
+  `cf_solver_enabled` 门控分支——开启且 `CAPTCHA_RUN_KEY` 已配置时，从
+  DOM 抓 `[data-sitekey]` 主动求解并回填 `cf-turnstile-response`（React
+  native setter，与既有二次复用同款）；求解失败/超时/无 sitekey/本地代理
+  端口一律原样回落既有被动轮询，现有逻辑一行未动。新配置键
+  `cf_solver_enabled`（默认 `false`）、`cf_solver_timeout`（默认 120s，
+  钳制 15-150s），env `CF_SOLVER_ENABLED` / `CF_SOLVER_TIMEOUT` 可覆盖。
+  关闭时行为零变更。
+
+### Added
+
 - **console.nace.ai provider** (in-process browser): referral invite →
   Cloudflare Turnstile (invisible/PRIME CONTROL) → Supabase email OTP →
   `/dashboard` → reveal a fresh `nace_sk_…` **API key**. Hub

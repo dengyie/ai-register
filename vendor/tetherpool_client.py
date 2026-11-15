@@ -5,6 +5,7 @@ Supports batch account allocation, zero-config parametric gateway URLs, and batt
 """
 
 import json
+import os
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse, urlencode, quote
@@ -33,11 +34,20 @@ class TetherPoolClient:
         self,
         api_base: str = "http://127.0.0.1:9100",
         gateway_base: str = "http://127.0.0.1:9101",
-        timeout: float = 15.0
+        timeout: float = 15.0,
+        api_token: Optional[str] = None,
     ):
         self.api_base = api_base.rstrip("/")
         self.gateway_base = gateway_base.rstrip("/")
         self.timeout = timeout
+        # Control-plane bearer token (IP_POOL_API_TOKEN global or a per-service
+        # token). Read lazily from env when not passed explicitly so callers get
+        # tokenized deployments for free.
+        self.api_token = (
+            api_token
+            if api_token is not None
+            else os.environ.get("TETHERPOOL_API_TOKEN", "").strip()
+        )
 
     def _http_request(
         self,
@@ -51,6 +61,8 @@ class TetherPoolClient:
             url += f"?{urlencode(params)}"
 
         headers = {"Accept": "application/json"}
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
         req_body = None
         if data is not None:
             headers["Content-Type"] = "application/json"
@@ -159,7 +171,7 @@ class TetherPoolClient:
         tier: str = "premium",
     ) -> Dict[str, Any]:
         """
-        Dedicated anti-sybil egress lease for batch registration bots (GET /v1/acquire_for_registration).
+        Dedicated anti-sybil egress lease for batch registration bots (POST /v1/acquire_for_registration).
 
         Ensures the allocated exit IP has not been used for `target_service` within the
         cooldown window (choose-then-lock serialized on the server). Writes the lease into
@@ -169,10 +181,17 @@ class TetherPoolClient:
          egress_type, cooldown_seconds, leased_at, cooled_until, relay_mode, relay_hop}.
 
         Raises RuntimeError with 'pool_exhausted'-style detail on 503 (all candidates cooled).
+
+        2026-11-15: the control plane moved this state-changing endpoint to POST-only
+        (GET now 405s) and its auth middleware keys per-service tokens off a `service`
+        query/body field — this endpoint's own param is `target_service`, so we mirror
+        it into a `service` param or the write is rejected 401 whenever any service
+        token is configured on the server.
         """
         params = {
             "account_id": account_id,
             "target_service": target_service,
+            "service": target_service,
             "cooldown": cooldown,
             "tier": tier,
         }
@@ -180,7 +199,7 @@ class TetherPoolClient:
             params["region"] = region
         if egress_type:
             params["egress_type"] = egress_type
-        return self._http_request("GET", "/v1/acquire_for_registration", params=params)
+        return self._http_request("POST", "/v1/acquire_for_registration", params=params)
 
     # --- Zero-Config Gateway URL Generation ---
 
@@ -236,6 +255,11 @@ class TetherPoolClient:
             "node_name": node_name,
             "event_type": error_type,
             "target_service": service,
+            # Mirror target_service into `service` so the control-plane auth
+            # middleware can match a per-service token (same fix as
+            # acquire_for_registration; without it this POST 401s on tokenized
+            # deployments).
+            "service": service,
             "force_rebind": force_rebind
         }
         return self._http_request("POST", "/v1/battery/event", data=payload)

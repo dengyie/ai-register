@@ -148,6 +148,11 @@ DEFAULT_CONFIG = {
     "mail_poll_interval": 2,
     # After email submit, wait this long for OTP form before treating as no-send.
     "email_submit_confirm_timeout": 12,
+    # Cloudflare 盾主动求解（slidex 打码站 turnstile 类型）。默认关闭：关闭时
+    # getTurnstileToken 完全走既有被动轮询，零行为变更。开启还需
+    # CAPTCHA_RUN_KEY（打码站 key）；求解失败一律回落被动路径。
+    "cf_solver_enabled": False,
+    "cf_solver_timeout": 120,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -458,6 +463,8 @@ _ENV_CONFIG_OVERLAYS = (
     ("CLASH_NODE_EXCLUDE", "clash_node_exclude"),
     ("CLASH_NODE_INCLUDE", "clash_node_include"),
     ("CPA_PROTOCOL_FLOW", "cpa_protocol_flow"),
+    ("CF_SOLVER_ENABLED", "cf_solver_enabled"),
+    ("CF_SOLVER_TIMEOUT", "cf_solver_timeout"),
 )
 
 
@@ -493,6 +500,8 @@ def apply_env_config_overrides(cfg: dict | None = None) -> dict:
         ("PROXY_ROTATE_UPDATE_CPA", "proxy_rotate_update_cpa", "bool"),
         ("CLASH_FLUSH_CONNECTIONS", "clash_flush_connections", "bool"),
         ("CLASH_RESTORE_ON_EXIT", "clash_restore_on_exit", "bool"),
+        ("CF_SOLVER_ENABLED", "cf_solver_enabled", "bool"),
+        ("CF_SOLVER_TIMEOUT", "cf_solver_timeout", "int"),
     ):
         raw = (os.environ.get(env_key) or "").strip()
         if not raw:
@@ -5367,10 +5376,157 @@ return 'pending';
     raise Exception(f"验证码已获取，但自动填写/提交失败: code={code} snap={snap}")
 
 
+def _cfg_truthy(value) -> bool:
+    """config 值宽松布尔：env overlay 进来的是字符串（"1"/"true"/"on"）。"""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _cf_solver_sitekey(page) -> str:
+    """从 DOM 抓 Turnstile sitekey；抓不到返回空串（调用方回落被动路径）。"""
+    try:
+        return str(
+            page.run_js(
+                """
+try {
+  const direct = document.querySelector('[data-sitekey]');
+  if (direct) return String(direct.getAttribute('data-sitekey') || '').trim();
+  const input = document.querySelector('input[name="cf-turnstile-response"]');
+  if (input && input.closest) {
+    const host = input.closest('[data-sitekey]');
+    if (host) return String(host.getAttribute('data-sitekey') || '').trim();
+  }
+  return '';
+} catch(e) { return ''; }
+                """
+            )
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _cf_solver_write_back(page, token: str) -> int:
+    """把求解得到的 token 回填到 cf-turnstile-response。返回回填后长度。
+
+    与二次复用（下方 fill_profile 循环内）同一套 React native setter 写法：
+    直接改 value 不会触发 React 受控组件更新，必须走原型 setter + 事件。
+    """
+    try:
+        synced = page.run_js(
+            """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return 0;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token);
+else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(cfInput.value || '').trim().length;
+            """,
+            token,
+        )
+        return int(synced or 0)
+    except Exception:
+        return 0
+
+
+def _solve_turnstile_with_cf_solver(log_callback=None, cancel_callback=None) -> str:
+    """主动求解 Turnstile（打码站 turnstile 类型）。失败返回 ""，由调用方回落。
+
+    门控（三重，全过才动手）：``cf_solver_enabled`` 开启 → ``CAPTCHA_RUN_KEY``
+    已配置 → 页面上能抓到 sitekey 且浏览器在用可被打码站触达的上游代理。
+
+    同出口 IP 铁律：传给打码站的必须是注册浏览器同一条上游代理（带凭据），
+    而不是本地代理桥（127.0.0.1:xxxx）——后者打码站无法从中解题。这也意味着
+    本地 Clash 端口（config proxy 默认 127.0.0.1:7890）上手动跑单时本功能
+    会自动跳过，生产必须用真实上游代理串。
+
+    任何异常都只记日志不抛出：主动求解是增强项，零回归优先。
+    """
+    if not isinstance(config, dict) or not _cfg_truthy(config.get("cf_solver_enabled")):
+        return ""
+    try:
+        from register_core import cf_solver
+    except Exception as exc:  # pragma: no cover - import 环境问题
+        if log_callback:
+            log_callback(f"[Debug] CF 主动求解不可用（import 失败）: {exc}")
+        return ""
+    if not cf_solver.solver_configured():
+        if log_callback:
+            log_callback("[Debug] CF 主动求解已开启但 CAPTCHA_RUN_KEY 未配置，回落被动等待")
+        return ""
+
+    page = _get_page()
+    if page is None:
+        return ""
+    url = str(getattr(page, "url", "") or "")
+    if not url.startswith("http"):
+        return ""
+
+    sitekey = _cf_solver_sitekey(page)
+    if not sitekey:
+        if log_callback:
+            log_callback("[Debug] CF 主动求解：页面无 data-sitekey，回落被动等待")
+        return ""
+
+    proxy = get_configured_proxy()
+    if proxy:
+        from urllib.parse import urlparse
+
+        host = (urlparse(proxy).hostname or "").strip().lower()
+        if host in ("localhost", "::1") or host.startswith("127."):
+            if log_callback:
+                log_callback(
+                    "[Debug] CF 主动求解跳过：上游代理是本地端口（打码站无法共用出口 IP）"
+                )
+            return ""
+
+    try:
+        timeout_s = float(config.get("cf_solver_timeout") or 120)
+    except (TypeError, ValueError):
+        timeout_s = 120.0
+    timeout_s = max(15.0, min(timeout_s, 150.0))
+
+    raise_if_cancelled(cancel_callback)
+    if log_callback:
+        log_callback(
+            f"[*] CF 主动求解 Turnstile：sitekey={sitekey} "
+            f"出口={'上游代理' if proxy else '打码站直连'} 预算={timeout_s:.0f}s"
+        )
+    try:
+        token = cf_solver.solve_turnstile_token(
+            url, sitekey, proxy=proxy, timeout_s=timeout_s
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] CF 主动求解失败，回落被动等待: {exc}")
+        return ""
+    raise_if_cancelled(cancel_callback)
+    synced = _cf_solver_write_back(page, token)
+    if synced >= 80:
+        return token
+    if log_callback:
+        log_callback(f"[Debug] CF 主动求解回填未生效（长度={synced}），回落被动等待")
+    return ""
+
+
 def getTurnstileToken(log_callback=None, cancel_callback=None):
     page = _get_page()
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
+
+    # 主动求解（可选，cf_solver_enabled 默认关闭）：成功直接返回，失败原样
+    # 走下面既有的被动轮询循环——现有逻辑一行不动，保证零回归。
+    solved = _solve_turnstile_with_cf_solver(
+        log_callback=log_callback, cancel_callback=cancel_callback
+    )
+    if solved:
+        if log_callback:
+            log_callback(f"[*] Turnstile 主动求解成功，token长度={len(solved)}")
+        return solved
 
     try:
         page.run_js(
