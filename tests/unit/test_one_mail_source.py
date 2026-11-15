@@ -152,6 +152,47 @@ class TestOneMailAdminMode(unittest.TestCase):
             with self.assertRaises(ProviderError):
                 src.poll_otp(mb, timeout_s=1, poll_interval_s=0.01)
 
+    def test_subaddress_variants(self) -> None:
+        from register_core.email.sources.one_mail import _subaddress_variants
+
+        self.assertEqual(
+            _subaddress_variants("u+grk1@gmail.com"), ["u+grk1@gmail.com", "u@gmail.com"]
+        )
+        self.assertEqual(_subaddress_variants("u@gmail.com"), ["u@gmail.com"])
+        self.assertEqual(_subaddress_variants(""), [])
+        # 没有任何 "+" 的多段 local 保持原样（catch-all 自造地址）
+        self.assertEqual(_subaddress_variants("a.b@c.test"), ["a.b@c.test"])
+
+    def test_poll_otp_alias_falls_back_to_base_address(self) -> None:
+        """x.ai 投递到聚合账号底址：别名查询空 → 用底址再查一次。"""
+        src = self._src()
+        rows = [{"from_addr": "noreply@x.ai", "code": "116-010", "subject": "s"}]
+
+        def fake_fetch(address, *, fresh_ms, limit):
+            return rows if address == "u@gmail.com" else []
+
+        with mock.patch.object(src, "_fetch_codes_admin", side_effect=fake_fetch) as fa:
+            otp = src.poll_otp(
+                Mailbox(address="u+grk1@gmail.com", provider="one_mail"),
+                timeout_s=5, poll_interval_s=0.01,
+            )
+        self.assertEqual(otp.code, "116-010")
+        self.assertEqual(
+            [c.args[0] for c in fa.call_args_list],
+            ["u+grk1@gmail.com", "u@gmail.com"],
+        )
+
+    def test_poll_otp_exact_address_hit_skips_fallback(self) -> None:
+        src = self._src()
+        rows = [{"from_addr": "s@x.ai", "code": "42", "subject": "s"}]
+        with mock.patch.object(src, "_fetch_codes_admin", return_value=rows) as fa:
+            otp = src.poll_otp(
+                Mailbox(address="u+grk1@gmail.com", provider="one_mail"),
+                timeout_s=5, poll_interval_s=0.01,
+            )
+        self.assertEqual(otp.code, "42")
+        self.assertEqual([c.args[0] for c in fa.call_args_list], ["u+grk1@gmail.com"])
+
 
 if __name__ == "__main__":
     unittest.main()

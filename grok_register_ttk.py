@@ -421,6 +421,9 @@ _ENV_CONFIG_OVERLAYS = (
     ("EMAIL_PROVIDER", "email_provider"),
     ("EMAIL_PROVIDERS", "email_providers"),
     ("EMAIL_PROVIDER_STRATEGY", "email_provider_strategy"),
+    ("HOTMAIL_ALLOW_PLUS_ALIAS", "hotmail_allow_plus_alias"),
+    ("HOTMAIL_ALIAS_MODE", "hotmail_alias_mode"),
+    ("HOTMAIL_MAX_ALIASES_PER_ACCOUNT", "hotmail_max_aliases_per_account"),
     ("MAIL_TIMEOUT", "mail_timeout"),
     ("MAIL_POLL_INTERVAL", "mail_poll_interval"),
     ("EMAIL_SUBMIT_CONFIRM_TIMEOUT", "email_submit_confirm_timeout"),
@@ -2420,11 +2423,17 @@ def _hotmail_parse_iso_ts(value):
         return 0
 
 
-def _hotmail_rest_get_code(mailbox_email, target_email, access_token, log_callback=None):
+def _hotmail_rest_get_code(
+    mailbox_email, target_email, access_token, log_callback=None, not_before_ts=None
+):
     """通过 Outlook Office REST 拉最近邮件并提取验证码。
 
     很多 consumer Hotmail 账号 OAuth 能过 IMAP AUTH，但 SELECT 报
     'User is authenticated but not connected'；REST 通常仍可用。
+
+    ``not_before_ts`` (epoch seconds) hard-floors the acceptable ReceivedDateTime
+    so a reused mailbox never returns a stale xAI code from a previous attempt
+    that is still inside the ``hotmail_recent_seconds`` window.
     """
     try:
         recent_seconds = int(config.get("hotmail_recent_seconds", 900) or 900)
@@ -2439,6 +2448,11 @@ def _hotmail_rest_get_code(mailbox_email, target_email, access_token, log_callba
         config.get("hotmail_require_recipient_match", True), default=True
     )
     filter_after_ts = int((time.time() - max(60, recent_seconds)) * 1000)
+    if not_before_ts:
+        try:
+            filter_after_ts = max(filter_after_ts, int(float(not_before_ts) * 1000))
+        except Exception:
+            pass
     target_lower = (target_email or "").strip().lower()
     keywords = [
         "x.ai",
@@ -2587,7 +2601,9 @@ def _hotmail_manual_prompt(mailbox_email, target_email, log_callback=None, promp
     return line
 
 
-def _hotmail_imap_get_code(mailbox_email, target_email, access_token, log_callback=None, host=None):
+def _hotmail_imap_get_code(
+    mailbox_email, target_email, access_token, log_callback=None, host=None, not_before_ts=None
+):
     import email as email_lib
     import imaplib
     from datetime import timezone
@@ -2605,6 +2621,14 @@ def _hotmail_imap_get_code(mailbox_email, target_email, access_token, log_callba
         config.get("hotmail_require_recipient_match", True), default=True
     )
     filter_after_ts = int((time.time() - max(60, recent_seconds)) * 1000)
+    # Reused mailbox hardening: never accept a code older than this registration
+    # attempt's send time (stale xAI code in the same 900s window was the
+    # email:invalid-validation-code root cause).
+    if not_before_ts:
+        try:
+            filter_after_ts = max(filter_after_ts, int(float(not_before_ts) * 1000))
+        except Exception:
+            pass
     target_lower = (target_email or "").strip().lower()
     keywords = [
         "x.ai",
@@ -2710,6 +2734,7 @@ def hotmail_get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    not_before_ts=None,
 ):
     token_info = _hotmail_token_map.get(dev_token)
     if not token_info:
@@ -2759,6 +2784,7 @@ def hotmail_get_oai_code(
                             email,
                             access_token,
                             log_callback=log_callback,
+                            not_before_ts=not_before_ts,
                         )
                         transport_ok = True
                         if code:
@@ -2781,6 +2807,7 @@ def hotmail_get_oai_code(
                                 access_token,
                                 log_callback=log_callback,
                                 host=imap_host,
+                                not_before_ts=not_before_ts,
                             )
                             transport_ok = True
                             # 成功连接但本轮未找到码，不必再换同邮箱另一个 host 重扫。
@@ -3677,6 +3704,7 @@ def get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    not_before_ts=None,
 ):
     provider = get_email_provider()
     if provider in ("fixed", "core", "register_core"):
@@ -3696,6 +3724,7 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+            not_before_ts=not_before_ts,
         )
     if provider in ("gmail", "google", "googlemail"):
         return gmail_get_oai_code(
@@ -4981,6 +5010,62 @@ def wait_for_code_form_after_email_submit(
     return False
 
 
+_NETLOG_INSTALL_JS = r"""
+try {
+  if (!window.__netLog) {
+    window.__netLog = [];
+    const cap = (e) => { try { window.__netLog.push(e); if (window.__netLog.length > 80) window.__netLog.shift(); } catch(_){} };
+    const of = window.fetch;
+    window.fetch = function(){
+      const a = arguments;
+      return of.apply(this, a).then(r => {
+        try {
+          const u = (a[0] && a[0].url) || a[0];
+          const cl = r.clone();
+          cl.text().then(b => cap({u: String(u), s: r.status, b: String(b).slice(0, 220)})).catch(() => cap({u: String(u), s: r.status, b: ''}));
+        } catch(_) {}
+        return r;
+      });
+    };
+    const oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; this.__m = m; return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function(){
+      this.addEventListener('load', () => { try { cap({u: String(this.__u), s: this.status, b: String(this.responseText || '').slice(0, 220)}); } catch(_){} });
+      return os.apply(this, arguments);
+    };
+  }
+} catch(e) {}
+"""
+
+_NETLOG_DUMP_JS = r"""
+try {
+  const log = (window.__netLog || []).filter(x => /api\/auth|verify-email|sign-up|send-verification/.test(String(x.u || ''))).slice(-8);
+  return JSON.stringify({url: location.href, text: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 420), log});
+} catch(e) { return String(e); }
+"""
+
+
+def _install_netlog_diag(page):
+    """Record recent auth API responses on the SPA page (GROK_DIAG only)."""
+    if not os.environ.get("GROK_DIAG") or page is None:
+        return
+    try:
+        page.run_js(_NETLOG_INSTALL_JS)
+    except Exception:
+        pass
+
+
+def _netlog_diag_dump(page, tag, log_callback):
+    """Log page text + captured auth responses for one tagged step (GROK_DIAG only)."""
+    if not os.environ.get("GROK_DIAG") or not log_callback:
+        return
+    try:
+        data = page.run_js(_NETLOG_DUMP_JS)
+        log_callback(f"[Diag] {tag}: {data}")
+    except Exception as exc:
+        log_callback(f"[Diag] {tag} dump失败: {exc}")
+
+
 def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
     page = _get_page()
     raise_if_cancelled(cancel_callback)
@@ -4998,6 +5083,9 @@ def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
         raise Exception("页面未就绪，无法填写邮箱")
     if log_callback:
         log_callback(f"[*] 已创建邮箱: {email}")
+    # Install before submit so the send-verification-code response is captured
+    # when the SPA stalls on the email step (domain-rejected vs transport).
+    _install_netlog_diag(page)
     # If still on provider chooser, re-click email signup before waiting on the input.
     if not _email_input_ready(page):
         try:
@@ -5118,6 +5206,7 @@ return true;
                 log_callback=log_callback,
                 cancel_callback=cancel_callback,
             ):
+                _netlog_diag_dump(page, "email-submit-fail", log_callback)
                 # Carry email so register_cli can release (not silent-lose) the
                 # reservation; post-submit SPA stall is not a permanent burn.
                 raise AccountRetryNeeded(
@@ -5151,6 +5240,11 @@ def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cance
     check_timeout(time.time())
     dump_state(page, "wait-code")
     take_screenshot(page, "wait-code")
+    _install_netlog_diag(page)
+
+    def _diag(tag):
+        _netlog_diag_dump(page, tag, log_callback)
+
     def _resend_code():
         page.run_js(
             r"""
@@ -5177,6 +5271,12 @@ return false;
     except Exception:
         mail_poll_interval = 2
 
+    # Floors the mailbox scan at just-before-this-send so a reused Hotmail
+    # mailbox can't hand back a stale xAI code from a prior attempt (that stale
+    # code was why verify-email returned ``email:invalid-validation-code``).
+    # 60s slack absorbs clock skew between us and the mail server while still
+    # excluding codes older than this attempt.
+    not_before_ts = time.time() - 60
     code = get_oai_code(
         dev_token,
         email,
@@ -5185,10 +5285,17 @@ return false;
         log_callback=log_callback,
         cancel_callback=cancel_callback,
         resend_callback=_resend_code,
+        not_before_ts=not_before_ts,
     )
     if not code:
         raise Exception("获取验证码失败")
-    clean_code = str(code).replace("-", "").strip()
+    # xAI codes are ``XXX-XXX`` (subject "806-738 xAI confirmation code"). The
+    # signup page uses ONE input[name="code"] sized for the dashes, so the
+    # aggregate must be filled WITH the dash. Stripping it to ``806738`` is what
+    # produced ``email:invalid-validation-code``. Keep the raw form and only
+    # strip for the multi-box OTP fallback (one char per box).
+    raw_code = str(code).strip()
+    clean_code = raw_code.replace("-", "")
     try:
         code_form_timeout = int(config.get("code_form_timeout", timeout) or timeout)
     except Exception:
@@ -5204,7 +5311,8 @@ return false;
             break
         filled = page.run_js(
             """
-const code = String(arguments[0] || '').trim();
+const codeRaw = String(arguments[0] || '').trim();
+const code = codeRaw.replace(/[-\\s]/g, '');
 if (!code) return 'empty-code';
 
 function isVisible(node) {
@@ -5233,7 +5341,11 @@ const aggregate = Array.from(document.querySelectorAll(
 if (aggregate) {
     aggregate.focus();
     aggregate.click();
-    setInputValue(aggregate, code);
+    const ml = Number(aggregate.maxLength || 0);
+    // Prefer the dashed form ("806-738") — xAI's single code input expects it.
+    // Only strip when the field is too short to hold the dash.
+    const val = (ml && ml > 0 && ml < codeRaw.length) ? code : codeRaw;
+    setInputValue(aggregate, val);
     return String(aggregate.value || '').replace(/\\s+/g, '') ? 'filled-aggregate' : 'aggregate-failed';
 }
 
@@ -5260,7 +5372,7 @@ if (otpBoxes.length >= code.length) {
 
 return 'not-ready';
             """,
-            clean_code,
+            raw_code,
         )
 
         if filled == "not-ready":
@@ -5358,6 +5470,7 @@ return 'pending';
             human_sleep(1.0, cancel_callback, min_seconds=0.6)
             if wait_for_profile_form(timeout=wait_budget, log_callback=log_callback, cancel_callback=cancel_callback):
                 return code
+            _diag("advanced-timeout")
             if log_callback:
                 log_callback("[Debug] advanced 未确认到资料页，当作未推进继续重试")
             human_sleep(0.5, cancel_callback, min_seconds=0.3)
@@ -5368,6 +5481,7 @@ return 'pending';
         human_sleep(0.5, cancel_callback, min_seconds=0.25)
 
     snap = _page_form_snapshot(page)
+    _diag("final-fail")
     if code_filled_once:
         # 码已写入页面，失败属于推进/资料页，不是“没拿到验证码”
         raise Exception(
@@ -5384,7 +5498,12 @@ def _cfg_truthy(value) -> bool:
 
 
 def _cf_solver_sitekey(page) -> str:
-    """从 DOM 抓 Turnstile sitekey；抓不到返回空串（调用方回落被动路径）。"""
+    """从 DOM 抓 Turnstile sitekey；抓不到返回空串（调用方回落被动路径）。
+
+    x.ai 注册页是 Next.js + ``turnstile.render()`` 显式渲染：DOM 里没有
+    ``data-sitekey``，sitekey 以 ``"sitekey":"0x4…"`` 形式内嵌在 RSC flight
+    payload 里。抓取顺序：data-sitekey 属性 → RSC payload → 全页 0x4 令牌。
+    """
     try:
         return str(
             page.run_js(
@@ -5397,6 +5516,15 @@ try {
     const host = input.closest('[data-sitekey]');
     if (host) return String(host.getAttribute('data-sitekey') || '').trim();
   }
+  // Next.js RSC flight payload: "sitekey":"0x4AAAA…"。浏览器 innerHTML 是
+  // 纯 JSON（引号不带反斜杠转义；escape 形状只出现在 curl 落盘的文件里，
+  // 与本 DOM 读取无关）。
+  const html = document.documentElement.innerHTML || '';
+  let m = html.match(/sitekey["']\\s*:\\s*["'](0x[0-9A-Za-z_-]{8,})/);
+  if (m) return m[1];
+  // Last resort: any 0x4-prefixed turnstile sitekey token on the page.
+  m = html.match(/\\b0x4[A-Za-z0-9_-]{10,}\\b/);
+  if (m) return m[0];
   return '';
 } catch(e) { return ''; }
                 """
