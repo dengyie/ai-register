@@ -59,9 +59,17 @@ def test_validate_this_run_rejects_token_email_mismatch() -> None:
     assert not validate_this_run(r)
 
 
-def test_adapter_guards_unmarked_success() -> None:
-    """adapter 出口护栏：无会话标记的 ok=True 被翻转为失败（case 2）。"""
+def test_adapter_guards_unmarked_success(monkeypatch) -> None:
+    """adapter 出口护栏：无会话标记的 ok=True 被翻转为失败（case 2）。
+
+    本用例验证的是**出口护栏**，不启动浏览器：flow 被整体打桩。但 adapter
+    的 preflight 在有头 Chromium 探测上会先 fail-fast（Linux 无 DISPLAY），
+    导致护栏根本走不到。这里显式声明 xvfb 环境（DISPLAY 非空）以隔离
+    preflight——生产上该守卫照常生效，测试不再依赖 runner 是否带 GUI。
+    """
     from register_core.providers.zai_adapter import ZaiProvider
+
+    monkeypatch.setenv("DISPLAY", ":99")
 
     prov = ZaiProvider(
         onemail_admin_key="k", hub_key="k", handle="ashisle87",
