@@ -25,8 +25,9 @@ bundled MV3 extension clears it in ~3s on the pinned Chromium build (Chrome
 149 / ms-playwright `chromium-1228`).
 
 The extension at `providers/nace/extension/` is **MV3**. The repo-root
-`turnstilePatch/` is MV2 and crashes the renderer on Chrome 149+ — do not
-swap it in.
+`turnstilePatch/` is also MV3 since 2026-11-16 (backported from the
+production host); keep both content patches in sync — do not swap one in
+for the other unless you verify it against the pinned Chromium build.
 
 ## Hub
 
