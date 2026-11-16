@@ -40,7 +40,25 @@ from typing import Any
 import requests
 
 from register_core.contracts import Mailbox, OtpCode, OtpWaitDiagnostics
-from register_core.errors import FailFastError, MailMissError, ProviderError
+from register_core.errors import FailFastError, MailMissError, ProviderError, QuotaLimitedError
+
+
+def _quota_limited_from_response(resp: Any, source: str) -> QuotaLimitedError:
+    """把 503 配额协议响应转成 QuotaLimitedError（带 Retry-After 秒数）。
+
+    服务器保证 Retry-After 头存在（handleApiError 写死 no-store + Retry-After）；
+    头缺失/非法时回退 60s（一个保守的默认退避）。body 的 code/retry_at 仅用于
+    日志，不作为判定依据（判定只看 503 + 头，与服务器契约对齐）。
+    """
+    raw = resp.headers.get("Retry-After") if resp.headers is not None else None
+    try:
+        retry_after = float(raw) if raw is not None else 60.0
+    except (TypeError, ValueError):
+        retry_after = 60.0
+    return QuotaLimitedError(
+        f"{source}: http 503 quota limited (Retry-After={retry_after:.0f}s)",
+        retry_after=retry_after,
+    )
 
 
 def _subaddress_variants(address: str) -> list[str]:
@@ -200,6 +218,8 @@ class OneMailSource:
             )
         except requests.RequestException as exc:
             raise ProviderError(f"one_mail verifcodes transport: {exc}") from exc
+        if resp.status_code == 503:
+            raise _quota_limited_from_response(resp, "one_mail verifcodes")
         if resp.status_code != 200:
             raise ProviderError(f"one_mail verifcodes: http {resp.status_code}")
         body = resp.json() if isinstance(resp.json(), dict) else {}
@@ -223,6 +243,12 @@ class OneMailSource:
             raise ProviderError(
                 "one_mail admin verifcodes: http 401 (check ONEMAIL_ADMIN_KEY)"
             )
+        if resp.status_code == 503:
+            # one-mail 配额协议（worker handleApiError）：503 + JSON
+            # {code: D1_DAILY_READ_LIMIT|D1_DAILY_WRITE_LIMIT, retry_at} +
+            # Retry-After 头。这是有明确恢复时间的暂时态，交给 poll 循环
+            # 按 Retry-After 退避重试，而不是当场放弃注册。
+            raise _quota_limited_from_response(resp, "one_mail admin verifcodes")
         if resp.status_code != 200:
             raise ProviderError(f"one_mail admin verifcodes: http {resp.status_code}")
         body = resp.json() if isinstance(resp.json(), dict) else {}
@@ -317,8 +343,23 @@ class OneMailSource:
             return self._fetch_codes(jwt, fresh_ms=fresh_ms, limit=5)
 
         deadline = started + timeout_s
+        saw_quota_503 = False
         while _time.time() < deadline:
-            rows = _fetch()
+            try:
+                rows = _fetch()
+            except QuotaLimitedError as exc:
+                # 配额墙：按服务器 Retry-After 退避（封顶 30s、不超过剩余
+                # 窗口），窗口耗尽则以 d1_quota_503 归类失败——运维看到
+                # 「worker 配额打穿」而不是笼统的 no_mail。
+                saw_quota_503 = True
+                diag.poll_count += 1
+                diag.failure_class = "d1_quota_503"
+                self.last_wait_diagnostics = diag
+                remaining = deadline - _time.time()
+                if remaining <= 0:
+                    break
+                _time.sleep(min(max(exc.retry_after, 1.0), 30.0, remaining))
+                continue
             diag.poll_count += 1
             diag.message_scan_count += len(rows)
             for row in rows:
@@ -347,7 +388,9 @@ class OneMailSource:
             _time.sleep(poll_interval_s)
 
         diag.elapsed_seconds = _time.time() - started
-        diag.failure_class = diag.failure_class or "no_mail"
+        diag.failure_class = diag.failure_class or (
+            "d1_quota_503" if saw_quota_503 else "no_mail"
+        )
         self.last_wait_diagnostics = diag
         raise MailMissError(
             f"one_mail OTP timeout for {mailbox.address} after {timeout_s:.0f}s",

@@ -6,14 +6,18 @@ import unittest
 from unittest import mock
 
 from register_core.contracts import Mailbox
-from register_core.email.sources.one_mail import OneMailSource
-from register_core.errors import FailFastError, MailMissError, ProviderError
+from register_core.email.sources.one_mail import (
+    OneMailSource,
+    _quota_limited_from_response,
+)
+from register_core.errors import FailFastError, MailMissError, ProviderError, QuotaLimitedError
 
 
 class _Resp:
-    def __init__(self, status=200, body=None):
+    def __init__(self, status=200, body=None, headers=None):
         self.status_code = status
         self._body = body or {}
+        self.headers = headers or {}
 
     def json(self):
         return self._body
@@ -240,6 +244,64 @@ class TestOneMailAdminMode(unittest.TestCase):
             )
         self.assertEqual(otp.code, "42")
         self.assertEqual([c.args[0] for c in fa.call_args_list], ["u+grk1@gmail.com"])
+
+    def test_quota_limited_parse_uses_retry_after_header(self) -> None:
+        exc = _quota_limited_from_response(
+            _Resp(503, headers={"Retry-After": "120"}), "admin verifcodes"
+        )
+        self.assertIsInstance(exc, QuotaLimitedError)
+        self.assertAlmostEqual(exc.retry_after, 120.0)
+        # 头缺失/非法 → 保守回退 60s
+        self.assertAlmostEqual(_quota_limited_from_response(_Resp(503), "x").retry_after, 60.0)
+        self.assertAlmostEqual(
+            _quota_limited_from_response(
+                _Resp(503, headers={"Retry-After": "abc"}), "x"
+            ).retry_after,
+            60.0,
+        )
+
+    def test_poll_otp_retries_through_quota_503_and_succeeds(self) -> None:
+        """503 配额墙在轮询窗口内按 Retry-After 退避重试，恢复后照常取码。"""
+        src = self._src()
+        rows = [{"from_addr": "noreply@x.ai", "code": "116-010", "subject": "s"}]
+        effects = [QuotaLimitedError("503", retry_after=0.05), rows]
+        with mock.patch.object(src, "_fetch_codes_admin", side_effect=effects):
+            otp = src.poll_otp(
+                Mailbox(address="u@gmail.com", provider="one_mail"),
+                timeout_s=5, poll_interval_s=0.01,
+            )
+        self.assertEqual(otp.code, "116-010")
+        self.assertEqual(src.last_wait_diagnostics.poll_count, 2)
+        self.assertEqual(src.last_wait_diagnostics.failure_class, "")
+
+    def test_poll_otp_quota_503_until_deadline_classifies(self) -> None:
+        """窗口耗尽仍是配额墙 → failure_class=d1_quota_503（不再是笼统 no_mail）。"""
+        src = self._src()
+
+        def always_503(address, *, fresh_ms, limit):
+            raise QuotaLimitedError("503", retry_after=1.0)
+
+        with mock.patch.object(src, "_fetch_codes_admin", side_effect=always_503):
+            with self.assertRaises(MailMissError):
+                src.poll_otp(
+                    Mailbox(address="u@gmail.com", provider="one_mail"),
+                    timeout_s=0.3, poll_interval_s=0.01,
+                )
+        diag = src.last_wait_diagnostics
+        self.assertEqual(diag.failure_class, "d1_quota_503")
+        self.assertGreaterEqual(diag.poll_count, 1)
+
+    def test_admin_503_quota_response_is_retried_then_classified(self) -> None:
+        """真实 HTTP 层的 503 配额协议 → QuotaLimitedError → poll 循环退避重试；
+        窗口耗尽后归类 d1_quota_503（验证 503 分支在真 _fetch_codes_admin 里接通）。"""
+        src = self._src()
+        with mock.patch("register_core.email.sources.one_mail.requests.get",
+                        return_value=_Resp(503, headers={"Retry-After": "5"})):
+            with self.assertRaises(MailMissError):
+                src.poll_otp(Mailbox(address="a@x.tech", password="pw",
+                                     provider="one_mail"),
+                             timeout_s=0.3, poll_interval_s=0.01)
+        self.assertEqual(src.last_wait_diagnostics.failure_class, "d1_quota_503")
 
 
 if __name__ == "__main__":

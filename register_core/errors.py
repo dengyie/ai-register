@@ -40,5 +40,18 @@ class ProviderError(RegisterCoreError):
     """Product registration flow failed."""
 
 
+class QuotaLimitedError(RegisterCoreError):
+    """上游返回 503 配额/限流协议（D1_DAILY_*_LIMIT + Retry-After）。
+
+    与 ProviderError 的区别：这是**有明确恢复时间**的暂时态——在 OTP 轮询
+    窗口内按 Retry-After 退避重试是正确行为，而不是立即放弃整个注册。
+    retry_after 取服务器 Retry-After 头（秒），缺省 0 表示立即重试。
+    """
+
+    def __init__(self, message: str = "", *, retry_after: float = 0.0) -> None:
+        super().__init__(message)
+        self.retry_after = max(0.0, float(retry_after))
+
+
 class VerifyError(RegisterCoreError):
     """Post-register verification failed."""
