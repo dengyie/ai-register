@@ -38,6 +38,10 @@ def get_provider(name: str, **kwargs: Any) -> RegisterProvider:
         "nace-ai": "nace",
         "nace.ai": "nace",
         "drex": "nace",
+        "z-ai": "zai",
+        "z.ai": "zai",
+        "zcode": "zai",
+        "glm": "zai",
     }
     key = aliases.get(key, key)
     if key not in _FACTORY:
@@ -55,6 +59,7 @@ def _ensure_builtins() -> None:
     from register_core.providers.nace_adapter import NaceProvider
     from register_core.providers.outlook_adapter import OutlookProvider
     from register_core.providers.typesafe_adapter import TypesafeProvider
+    from register_core.providers.zai_adapter import ZaiProvider
 
     built: dict[str, Callable[..., RegisterProvider]] = {
         "grok": lambda **kw: GrokProvider(**kw),
@@ -63,6 +68,7 @@ def _ensure_builtins() -> None:
         "outlook": lambda **kw: OutlookProvider(**kw),
         "typesafe": lambda **kw: TypesafeProvider(**kw),
         "nace": lambda **kw: NaceProvider(**kw),
+        "zai": lambda **kw: ZaiProvider(**kw),
     }
     _FACTORY = {**built, **_FACTORY}
     _BUILTINS_READY = True

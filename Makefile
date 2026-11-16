@@ -33,6 +33,8 @@ syntax:
 	bash -n providers/typesafe/run-register.sh
 	bash -n providers/typesafe/smoke.sh
 	bash -n providers/chatgpt/run-register.sh
+	bash -n providers/zai/run-register.sh
+	bash -n providers/zai/join-hub.sh
 	bash -n scripts/setup_simple.sh
 	bash -n scripts/doctor_secrets.sh
 	bash -n scripts/build_web_console.sh
@@ -44,7 +46,12 @@ syntax:
 	  scripts/probe_clash_nodes.py mail_pool_probe.py \
 	  register_core/providers/typesafe_adapter.py register_core/verify/typesafe_key.py \
 	  providers/typesafe/protocol/flow.py providers/typesafe/protocol/session.py \
-	  providers/typesafe/protocol/constants.py apps/control_api/schemas.py
+	  providers/typesafe/protocol/constants.py apps/control_api/schemas.py \
+	  register_core/providers/zai_adapter.py register_core/verify/zai_hub.py \
+	  providers/zai/protocol/flow.py providers/zai/protocol/mailbox.py \
+	  providers/zai/protocol/naming.py providers/zai/protocol/sliders.py \
+	  providers/zai/protocol/signup.py providers/zai/protocol/complete.py \
+	  providers/zai/protocol/hub.py tests/unit/test_zai_provider.py
 doctor:
 	bash scripts/doctor_secrets.sh || test $$? -eq 2
 

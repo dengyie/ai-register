@@ -9,6 +9,7 @@ Product packages. Each provider owns its browser stack and (for black-box runner
 | **ChatGPT / OpenAI** | `providers/chatgpt/` | Python + curl_cffi + EmailSource | `./register.sh chatgpt` | production protocol |
 | **typesafe.ai / jev** | `providers/typesafe/` | Python + requests + EmailSource | `./register.sh typesafe` | in-process protocol |
 | **console.nace.ai** | `providers/nace/` | Python + DrissionPage + Turnstile patch | `./register.sh nace` | in-process browser |
+| **z.ai (ZCode)** | `providers/zai/` | Python + playwright + slidex (aliyun sliders) + one-mail catch-all | `./register.sh zai` / `zai-join` | in-process protocol (JWT) |
 | **_template** | `providers/_template/` | your choice | — | copy-me |
 
 Layered orchestration (not a replacement for the above):

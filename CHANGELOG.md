@@ -44,6 +44,17 @@ project versioning follows [Semantic Versioning](https://semver.org/).
   once in a readonly `input[aria-label="New API key"]`). Full provider run
   verified 2026-10-11: `ok=True`, `secret_kind=api_key`, live key
   `POST https://console.nace.ai/v1/systemone` (model `drex-v1.5`) → HTTP 200.
+- **z.ai (ZCode Coding Plan) provider** (in-process, `providers/zai/`): two-stage
+  email signup (signup → verify-link → Complete Registration) producing a chat.z.ai
+  JWT (`secret_kind="jwt"`). Mailbox = one-mail catch-all prefix invention read via
+  unified admin API with client-side `to_addr` filtering (decoupled from address-row
+  name alignment). Receipt chain immune to slidex false-success (signup POST NET tap
+  → fresh-link baseline dedup → JWT email-claim gate); fresh-session rotation with
+  cookie_id churn and per-session hard timeouts. Operator-explicit hub join
+  (`./register.sh zai-join`) with pool-verify gate (`register_core/verify/zai_hub.py`).
+  Handles are natural-word alnum-only (dot-blackhole lesson) with dual uniqueness
+  preflight. Tests: `tests/unit/test_zai_provider.py`.
+
 - **typesafe.ai / jev console provider** (in-process): Stytch magic-link →
   `/api/auth/callback` → `/api/api-keys`. Hub `./register.sh typesafe [count]`,
   aliases `jev` / `typesafe-ai`. Default mailbox is tinyhost (full body).

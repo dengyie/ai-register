@@ -167,7 +167,19 @@ class TestComposite(unittest.TestCase):
         self.assertEqual(comp.allocate().address, "a@b.com")
         self.assertEqual(comp.poll_otp(box).code, "123456")
         comp.release(box, success=True)
-        mb.release.assert_called_once_with(box, success=True)
+        # Composite 显式转发 consumed（默认 False）给底层 mailbox：底层
+        # release 的 consumed 语义不能被吞掉。
+        mb.release.assert_called_once_with(box, success=True, consumed=False)
+
+    def test_delegate_release_forwards_consumed(self):
+        mb = MagicMock()
+        mb.name = "cloudflare"
+        dec = MagicMock()
+        dec.name = "cloudflare"
+        box = Mailbox(address="a@b.com", token="t", provider="cloudflare")
+        comp = CompositeEmailSource(mb, dec)
+        comp.release(box, success=True, consumed=True)
+        mb.release.assert_called_once_with(box, success=True, consumed=True)
 
     def test_split_name(self):
         mb = MagicMock()

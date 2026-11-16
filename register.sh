@@ -33,6 +33,8 @@ register.sh — multi-provider hub (ai-register-machine)
   ./register.sh chatgpt [count]          Register OpenAI platform account (protocol)
   ./register.sh typesafe [count] [threads] Register typesafe.ai / jev console API key (protocol)
   ./register.sh nace [count]             Register console.nace.ai API key (browser + Turnstile)
+  ./register.sh zai [count]               Register chat.z.ai ZCode plan (slidex sliders + one-mail catch-all)
+  ./register.sh zai-join <token-file> [label]  Operator: OAuth-join z.ai JWT into zcode-hub + pool verify
   ./register.sh outlook [count] [threads] Register Microsoft Outlook account (register_core Pipeline; gated)
   ./register.sh core list                Layered framework: list providers/email
   ./register.sh core run -p mimo -n 1    Layered framework: pipeline run
@@ -403,6 +405,24 @@ case "$cmd" in
         exit 2
         ;;
     esac
+    ;;
+  zai|z-ai|z.ai)
+    COUNT="${1:-1}"
+    export COUNT
+    # chat.z.ai 两段式注册（signup + verify link）→ 真实 JWT。
+    # 邮箱 = one-mail catch-all 前缀发明（unified admin API 读信，与地址行解耦）；
+    # 滑块 = slidex aliyun_captcha_js（需有头 Chromium / GUI 会话）。
+    # hub 入池是操作员显式命令：./register.sh zai-join <token-file>
+    if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+      echo "register.sh: zai count must be a number (got '$COUNT')" >&2
+      exit 2
+    fi
+    exec bash "$ROOT/providers/zai/run-register.sh" "$COUNT"
+    ;;
+  zai-join|z-ai-join)
+    # 操作员显式命令：token 文件 → OAuth 四步直投 zcode-hub → 池核验门禁
+    shift
+    exec bash "$ROOT/providers/zai/join-hub.sh" "$@"
     ;;
   *)
     echo "unknown command: $cmd" >&2

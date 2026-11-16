@@ -50,6 +50,7 @@ ai-register-machine/
 │   ├── mimo/                   # Xiaomi MiMo (Node/Playwright) — production
 │   ├── chatgpt/                # OpenAI platform protocol (curl_cffi + EmailSource)
 │   ├── typesafe/               # typesafe.ai / jev console (Stytch magic-link)
+│   ├── zai/                    # chat.z.ai ZCode plan (slidex sliders + one-mail catch-all → JWT)
 │   └── grok/                   # Grok layout notes (runtime still root paths)
 ├── docs/
 │   ├── ADDING_PROVIDER.md

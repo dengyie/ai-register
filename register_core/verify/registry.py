@@ -30,4 +30,8 @@ def get_verifier(name: str, **kwargs: Any) -> Verifier:
         from register_core.verify.nace_key import NaceKeyVerifier
 
         return NaceKeyVerifier(**kwargs)
+    if key in ("zai", "z-ai", "z.ai", "zcode", "zai_hub", "zai-hub"):
+        from register_core.verify.zai_hub import ZaiHubVerifier
+
+        return ZaiHubVerifier(**kwargs)
     raise KeyError(f"unknown verifier: {name!r}")
