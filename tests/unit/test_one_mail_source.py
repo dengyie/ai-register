@@ -163,6 +163,54 @@ class TestOneMailAdminMode(unittest.TestCase):
         # 没有任何 "+" 的多段 local 保持原样（catch-all 自造地址）
         self.assertEqual(_subaddress_variants("a.b@c.test"), ["a.b@c.test"])
 
+    def test_subaddress_variants_gmail_dot_trick(self) -> None:
+        """gmail 点号变体的查询归一：x.ai 限流同样归一 gmail（变体绕不开
+        rate-limit，已实测证伪），D1 入库底址是规范形，查询必须落到底址。"""
+        from register_core.email.sources.one_mail import _subaddress_variants
+
+        self.assertEqual(
+            _subaddress_variants("jane.doe+grk9@gmail.com"),
+            ["jane.doe+grk9@gmail.com", "janedoe@gmail.com"],
+        )
+        self.assertEqual(
+            _subaddress_variants("Jane.Doe@googlemail.com"),
+            ["Jane.Doe@googlemail.com", "janedoe@gmail.com"],
+        )
+        # 点号剥离只对 gmail/googlemail 生效：其它域名点号是语义的一部分
+        self.assertEqual(
+            _subaddress_variants("a.b+x@c.test"), ["a.b+x@c.test", "a.b@c.test"]
+        )
+
+    def test_subaddress_variants_do_not_duplicate_lowercase(self) -> None:
+        """客户端不自己造小写候选：worker 的 buildVerifAddrClause 会把
+        ``addr`` 入参统一 lower()，且读侧按 ``to_addr COLLATE NOCASE`` 比较
+        （one-mail PR #180）。客户端多打一个小写候选只是白花一次 HTTP。"""
+        from register_core.email.sources.one_mail import _subaddress_variants
+
+        self.assertEqual(
+            _subaddress_variants("Jane.Doe+grk9@Gmail.com"),
+            ["Jane.Doe+grk9@Gmail.com", "janedoe@gmail.com"],
+        )
+        self.assertEqual(
+            _subaddress_variants("Jane.Doe@Outlook.com"), ["Jane.Doe@Outlook.com"]
+        )
+
+    def test_admin_query_sends_addr_verbatim(self) -> None:
+        """客户端按原样发 addr（含大小写）：大小写归一是**服务端**职责，
+        客户端擅自改写会掩盖「服务端没归一」的真实故障。
+
+        轮询会重试多次，所以断言的是「每次都用原样地址」，不是调用次数。"""
+        src = self._src()
+        with mock.patch.object(src, "_fetch_codes_admin", return_value=[]) as fa:
+            with self.assertRaises(MailMissError):
+                src.poll_otp(
+                    Mailbox(address="KevinWalters5892@outlook.com", provider="one_mail"),
+                    timeout_s=0.2, poll_interval_s=0.05,
+                )
+        sent = [c.args[0] for c in fa.call_args_list]
+        self.assertTrue(sent)
+        self.assertEqual(set(sent), {"KevinWalters5892@outlook.com"})
+
     def test_poll_otp_alias_falls_back_to_base_address(self) -> None:
         """x.ai 投递到聚合账号底址：别名查询空 → 用底址再查一次。"""
         src = self._src()

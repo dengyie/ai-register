@@ -66,6 +66,32 @@ project versioning follows [Semantic Versioning](https://semver.org/).
   so allocate is not followed by a second login GET unless magic-link POST
   needs a refresh. Mailbox timeout stays `mail_miss`. Verifier `live=True`
   is still shape-only (no spend). Magic-link extract parses query order.
+
+### Fixed
+
+- **grok CF 主动求解的 sitekey 抓取走错路径（2026-11-16 实测修正）**：
+  真实 x.ai 注册页在浏览器 `innerHTML` 里的 RSC flight payload 是**转义**
+  形态 `sitekey\":\"0x4…`（引号前带反斜杠），而旧主正则要求未转义引号，
+  **从未命中**——实际是靠兜底的「整页任意 0x4 令牌」兜住的。页面上一旦出现
+  第二个 0x4 形状 token（nonce 等），兜底就会抓错。主正则改为引号前允许
+  一个可选反斜杠（`sitekey\\?["']\s*:\s*\\?["'](0x…)`），转义/未转义两种
+  形态都命中。sitekey 模式提为 `_SITEKEY_RSC_PATTERN` / `_SITEKEY_SCRIPT`
+  共享常量（JS 字面量与 Python `re` 同源，避免两边漂移），并新增 5 条离线
+  回归测试（转义/未转义/decoy 优先/无 sitekey/脚本与常量一致）。
+  验证方式：真 Chrome + 真实页面存档实测主正则命中（非兜底）。
+- **one-mail admin 通道别名查询的 gmail 归一（2026-11-16）**：x.ai 把验证码
+  投给聚合账号底址，one-mail D1 入库也是底址，注册侧只有自己造的
+  `u+grk1@gmail.com`。查询候选现按 gmail 三件套归一（剥 `+tag`、剥 `.`、
+  `googlemail.com`→`gmail.com`），别名查询空结果后退回规范底址再查。
+  注：点号变体**绕不开** x.ai 的同地址 rate-limit（x.ai 限流前同样归一
+  gmail 地址），本归一只解决查询侧对齐。
+- **one-mail 收件人大小写契约（2026-11-16，客户端侧复核）**：one-mail 的
+  `emails.to_addr` 读侧已改 `COLLATE NOCASE`（one-mail PR #180），写侧归一
+  成小写；worker 的 `buildVerifAddrClause` 会把 `addr` 入参统一 `lower()`。
+  **客户端因此不需要自己造小写候选**——多打一个候选只是白花一次 HTTP，
+  且会掩盖「服务端没归一」的真实故障。`_subaddress_variants` 保持只做
+  gmail 底址归一，`addr` 按原样发送；新增 2 条离线回归测试锁死该契约
+  （不产生重复小写候选 / `addr` 原样发送）。
 - typesafe batch (`./register.sh typesafe N` with N>1): continue on
   `mail_miss`/`network` (hard kinds still stop), in-process workers default 8
   capped at 32, unique `typesafe-*.json` names. Pipeline fan-out is only for

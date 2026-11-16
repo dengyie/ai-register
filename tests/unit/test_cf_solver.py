@@ -409,3 +409,62 @@ def test_get_turnstile_token_falls_back_to_passive_loop(monkeypatch, ttk):
     page = _FakePage({"default": passive_token})
     monkeypatch.setattr(ttk, "_get_page", lambda: page)
     assert ttk.getTurnstileToken() == passive_token
+
+
+# ────────────────────── sitekey 抓取模式 ──────────────────────
+#
+# 2026-11-16 真 Chrome + 真实 x.ai 页面存档实测：浏览器 innerHTML 里的
+# RSC payload 是**转义**形态 sitekey\":\"0x4…（引号前带反斜杠），不是未
+# 转义的纯 JSON。主正则若不兼容转义形态，就只能靠"整页任意 0x4 令牌"
+# 兜底——页面上出现第二个 0x4 形状 token 时会抓错。
+
+
+def _rsc_match(ttk, text: str):
+    import re
+
+    m = re.search(ttk._SITEKEY_RSC_PATTERN, text)
+    return m.group(1) if m else None
+
+
+def test_sitekey_pattern_matches_escaped_and_plain_shapes(ttk):
+    escaped = 'sitekey\\":\\"0x4AAAAAAAhr9JGVDZbrZOo0\\",\\"nonce\\":\\"abc\\"'
+    plain = '"sitekey":"0x4AAAAAAAhr9JGVDZbrZOo0","nonce":"abc"'
+    assert _rsc_match(ttk, escaped) == "0x4AAAAAAAhr9JGVDZbrZOo0"
+    assert _rsc_match(ttk, plain) == "0x4AAAAAAAhr9JGVDZbrZOo0"
+
+
+def test_sitekey_pattern_prefers_sitekey_over_decoy_token(ttk):
+    """页面同时有别的 0x4 形状 token 时，正则必须抓 sitekey 那个。"""
+    text = (
+        '{\\"nonce\\":\\"0x4DECOYVALUE0000000\\",'
+        '\\"sitekey\\":\\"0x4REALKEY000000000000\\"}'
+    )
+    assert _rsc_match(ttk, text) == "0x4REALKEY000000000000"
+
+
+def test_sitekey_pattern_ignores_pages_without_sitekey(ttk):
+    assert _rsc_match(ttk, '{"nonce":"0x4DECOYVALUE0000000"}') is None
+
+
+def test_sitekey_script_embeds_the_shared_pattern(ttk):
+    """JS 脚本里的正则必须来自同一个常量（避免两边漂移）。"""
+    script = ttk._SITEKEY_SCRIPT.replace("__SITEKEY_RSC__", ttk._SITEKEY_RSC_PATTERN)
+    assert "__SITEKEY_RSC__" not in script
+    assert ttk._SITEKEY_RSC_PATTERN in script
+
+
+def test_sitekey_helper_uses_shared_script(monkeypatch, ttk):
+    """_cf_solver_sitekey 走共享脚本，且脚本里没有裸占位符。"""
+    seen: list[str] = []
+
+    class _Page:
+        url = "https://accounts.x.ai/sign-up"
+
+        def run_js(self, script, *args):
+            seen.append(script)
+            return "0x4AAAAAAAhr9JGVDZbrZOo0"
+
+    page = _Page()
+    monkeypatch.setattr(ttk, "_get_page", lambda: page)
+    assert ttk._cf_solver_sitekey(page) == "0x4AAAAAAAhr9JGVDZbrZOo0"
+    assert seen and "__SITEKEY_RSC__" not in seen[0]

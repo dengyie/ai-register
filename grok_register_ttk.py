@@ -5497,17 +5497,19 @@ def _cfg_truthy(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _cf_solver_sitekey(page) -> str:
-    """从 DOM 抓 Turnstile sitekey；抓不到返回空串（调用方回落被动路径）。
+# x.ai 注册页 RSC flight payload 的 sitekey 模式。
+#
+# 真实形态（2026-11-16 真 Chrome + 真实页面存档实测）：浏览器
+# ``document.documentElement.innerHTML`` 里是**转义**的 —— sitekey\":\"0x4…
+# （反斜杠跟着引号），不是未转义的纯 JSON。所以每个引号前都允许一个可选的
+# 反斜杠，两种形态都能匹配。
+#
+# 同一份模式 JS 正则字面量与 Python re 共用：``\\?``（可选字面反斜杠）、
+# ``\s``、``["\']`` 在两侧语义一致，单测可离线覆盖（见
+# tests/unit/test_cf_solver.py）。
+_SITEKEY_RSC_PATTERN = r'sitekey\\?["\']\s*:\s*\\?["\'](0x[0-9A-Za-z_-]{8,})'
 
-    x.ai 注册页是 Next.js + ``turnstile.render()`` 显式渲染：DOM 里没有
-    ``data-sitekey``，sitekey 以 ``"sitekey":"0x4…"`` 形式内嵌在 RSC flight
-    payload 里。抓取顺序：data-sitekey 属性 → RSC payload → 全页 0x4 令牌。
-    """
-    try:
-        return str(
-            page.run_js(
-                """
+_SITEKEY_SCRIPT = """
 try {
   const direct = document.querySelector('[data-sitekey]');
   if (direct) return String(direct.getAttribute('data-sitekey') || '').trim();
@@ -5516,21 +5518,33 @@ try {
     const host = input.closest('[data-sitekey]');
     if (host) return String(host.getAttribute('data-sitekey') || '').trim();
   }
-  // Next.js RSC flight payload: "sitekey":"0x4AAAA…"。浏览器 innerHTML 是
-  // 纯 JSON（引号不带反斜杠转义；escape 形状只出现在 curl 落盘的文件里，
-  // 与本 DOM 读取无关）。
+  // Next.js RSC flight payload: sitekey":"0x4AAAA…（真实页面为转义形态，
+  // 引号前允许一个可选反斜杠；未转义形态同样命中）。
   const html = document.documentElement.innerHTML || '';
-  let m = html.match(/sitekey["']\\s*:\\s*["'](0x[0-9A-Za-z_-]{8,})/);
+  let m = html.match(/__SITEKEY_RSC__/);
   if (m) return m[1];
   // Last resort: any 0x4-prefixed turnstile sitekey token on the page.
   m = html.match(/\\b0x4[A-Za-z0-9_-]{10,}\\b/);
   if (m) return m[0];
   return '';
 } catch(e) { return ''; }
-                """
-            )
-            or ""
-        ).strip()
+"""
+
+
+def _cf_solver_sitekey(page) -> str:
+    """从 DOM 抓 Turnstile sitekey；抓不到返回空串（调用方回落被动路径）。
+
+    x.ai 注册页是 Next.js + ``turnstile.render()`` 显式渲染：DOM 里没有
+    ``data-sitekey``，sitekey 以 ``"sitekey":"0x4…"`` 形式内嵌在 RSC flight
+    payload 里。抓取顺序：data-sitekey 属性 → RSC payload → 全页 0x4 令牌。
+
+    兜底（整页任意 0x4 令牌）只在 RSC 正则落空时启用：页面上若同时存在
+    其它 0x4 形状 token（nonce 等），兜底可能抓到错的，所以 RSC 正则必须
+    自己能命中转义形态。
+    """
+    try:
+        script = _SITEKEY_SCRIPT.replace("__SITEKEY_RSC__", _SITEKEY_RSC_PATTERN)
+        return str(page.run_js(script) or "").strip()
     except Exception:
         return ""
 

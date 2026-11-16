@@ -44,19 +44,39 @@ from register_core.errors import FailFastError, MailMissError, ProviderError
 
 
 def _subaddress_variants(address: str) -> list[str]:
-    """admin 查询的地址候选：原样优先，其次 ``+tag`` 归一后的底址。
+    """admin 查询的地址候选：原样优先，其次 gmail 归一后的底址。
 
     x.ai 把验证码投给聚合账号的**底址**（``u@gmail.com``），one-mail 入库的
     也是底址；而注册流程手里只有自己造的 ``u+grk1@gmail.com``。直接拿别名查
     ``/api/unified/verifcodes?addr=`` 一条都取不到。先按原样查（catch-all 自造
-    地址就是精确地址，语义不变），空结果再退回底址。
+    地址就是精确地址，语义不变），空结果再退归一底址。
+
+    大小写不需要在这里归一：worker 的 ``buildVerifAddrClause`` 会把 ``addr``
+    入参统一 lower()，且读侧按 ``to_addr COLLATE NOCASE`` 比较
+    （one-mail PR #180），所以「库里存大写 / 查小写」这类历史错配由**服务端**
+    负责吸收。客户端若自己再造一个小写候选，只会平白多打一次 HTTP。
+
+    gmail/googlemail 归一三件套：``+tag`` 剥离、``.`` 点号剥离、
+    ``googlemail.com``→``gmail.com``——D1 底址永远是规范形
+    ``somebody@gmail.com``，注册侧无论用 ``some.body+x@gmail.com``
+    还是别的变体，查询都能落到底址。（注意：点号变体**绕不开** x.ai 的
+    同地址 rate-limit——x.ai 限流前同样归一 gmail 地址，实测仍命中底址
+    限流桶；本归一只是查询侧对齐，不是限流规避。）
     """
     addr = (address or "").strip()
     if not addr:
         return []
     out = [addr]
     local, sep, domain = addr.rpartition("@")
-    if sep and "+" in local:
+    if not sep:
+        return out
+    domain_l = domain.lower()
+    if domain_l in ("gmail.com", "googlemail.com"):
+        canonical_local = local.split("+", 1)[0].replace(".", "").lower()
+        canonical = f"{canonical_local}@gmail.com"
+        if canonical not in out:
+            out.append(canonical)
+    elif "+" in local:
         base = f"{local.split('+', 1)[0]}@{domain}"
         if base not in out:
             out.append(base)
