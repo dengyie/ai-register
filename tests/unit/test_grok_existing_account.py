@@ -83,22 +83,60 @@ def test_fill_code_checks_existing_account_before_retries() -> None:
 def test_cli_swaps_mailbox_on_email_exists_without_slot_retry() -> None:
     """register_cli must burn + swap mailbox on EmailExistsError, keep ARN semantics.
 
-    The handler must be a narrowing guard placed ahead of the broad handlers,
-    re-raising everything that is not EmailExistsError so AccountRetryNeeded
-    still reaches its own slot-retry handler.
+    except-clause ORDER is load-bearing: the precise AccountRetryNeeded clause
+    must come FIRST (its cleanups run before the outer slot-retry handler); the
+    single generic Exception clause handles EmailExists (positive isinstance,
+    burn+swap) and allocation transport errors BEFORE classify(). Sibling
+    except clauses never catch a re-raise from a prior clause, so no
+    re-raise-based narrowing is allowed here.
     """
     src = _load_cli_source()
     fn_start = src.index("def register_one(")
     fn_end = src.index("\ndef ", fn_start + 10)
     body = src[fn_start:fn_end]
-    assert "isinstance(exc, EmailExistsError)" in body
-    # Non-matching exceptions re-raised (ARN not swallowed).
-    assert "if not (EmailExistsError is not None and isinstance(exc, EmailExistsError)):" in body
-    assert body.index("if not (EmailExistsError is not None") < body.index("except AccountRetryNeeded:")
+    # ARN clause precedes any broad Exception clause in the mail_try chain.
+    assert body.index("except AccountRetryNeeded:") < body.index(
+        "except Exception as exc:\n                    msg = str(exc)"
+    ), "ARN clause must be first so its cleanups run"
+    # EmailExists handled by positive isinstance inside the generic clause.
+    assert "if EmailExistsError is not None and isinstance(exc, EmailExistsError):" in body
     # Terminal burn + provider advance (swap mailbox, not slot).
-    assert "_mark_email_stage_error(email, f\"existing_account:" in body
+    assert '_mark_email_stage_error(email, f"existing_account:' in body
     assert "_advance_mail_provider_on_miss()" in body
-    print("PASS register_cli burn+swap on EmailExistsError, ARN untouched")
+    # Allocation transport failover branch (email=="" gate).
+    assert "is_mail_alloc_transport_error" in body
+    assert "not email and is_mail_alloc_transport_error(msg)" in body
+    print("PASS register_cli burn+swap on EmailExistsError + transport failover, ARN first")
+
+
+def test_mail_alloc_transport_error_matches_production_shapes() -> None:
+    """The transport matcher must catch the real NXDOMAIN / SSL error shapes."""
+    src = _load_cli_source()
+    tree = ast.parse(src)
+    ns: dict = {}
+    fn = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "is_mail_alloc_transport_error"
+    )
+    mod = ast.Module(body=[fn], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    exec(compile(mod, "<alloc>", "exec"), ns)
+    match = ns["is_mail_alloc_transport_error"]
+    # Real production error (instabox3 2026-11-19, curl_cffi via tetherpool).
+    assert match(
+        "Failed to perform, curl: (35) BoringSSL SSL_connect: Connection closed "
+        "abruptly (SSL_ERROR_SYSCALL; error queue empty) in connection to "
+        "temp-mail.mangoqwq.com:443"
+    )
+    assert match("Could not resolve host: temp-mail.mangoqwq.com")
+    assert match("Connection refused by peer")
+    assert match("The read operation timed out")
+    # Non-transport failures must NOT match.
+    assert not match("验证码已填写，但未进入资料页")
+    assert not match("未找到「使用邮箱注册」按钮或邮箱表单未出现")
+    assert not match("")
+    print("PASS is_mail_alloc_transport_error production shapes + negatives")
 
 
 def test_existing_account_not_classified_as_progress_fail() -> None:

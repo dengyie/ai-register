@@ -4529,6 +4529,48 @@ def chrome_error_summary(page) -> str:
     return f"url={url!r} title={title!r} body={body!r}"
 
 
+_JS_REACT_HYDRATED_CHECK = r"""
+function hasFiberKey(el) {
+  if (!el) return false;
+  const keys = Object.keys(el);
+  for (const k of keys) {
+    if (k.startsWith('__reactFiber$') || k.startsWith('__reactContainer$') || k.startsWith('__reactProps$')) return true;
+  }
+  return false;
+}
+// Interactive nodes the SPA wires listeners onto.
+const nodes = document.querySelectorAll('button, [role="button"], input, main');
+for (const el of nodes) {
+  if (hasFiberKey(el)) return true;
+}
+return false;
+"""
+
+
+def _wait_react_hydrated(page, timeout=8.0, log_callback=None, cancel_callback=None) -> bool:
+    """Wait until the SPA shows React fiber keys (hydration done).
+
+    Production evidence (instabox3 2026-11-19): accounts.x.ai loaded over a slow
+    tetherpool egress (~2min), then "Sign up with email" was clicked twice
+    pre-hydration — dispatch/native click both no-op without React listeners,
+    the email form never mounted, and the batch died as kind=other in ~2.5min.
+    Waiting for hydration before the first click removes that race cheaply;
+    timeout fallback preserves current behavior (click anyway) on broken pages.
+    """
+    if page is None:
+        return False
+    deadline = time.time() + max(1.0, float(timeout or 8.0))
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        try:
+            if page.run_js(_JS_REACT_HYDRATED_CHECK):
+                return True
+        except Exception:
+            return False
+        human_sleep(0.3, cancel_callback, min_seconds=0.2)
+    return False
+
+
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
     page = _get_page()
     # Prefer config timeout when caller uses the default.
@@ -4556,6 +4598,12 @@ def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=Non
 
         if log_callback:
             log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
+
+        # Hydration gate: pre-hydration clicks never mount the email form
+        # (slow egress race). Bounded wait; falls through to click on timeout.
+        if not _wait_react_hydrated(page, timeout=8.0, cancel_callback=cancel_callback):
+            if log_callback:
+                log_callback("[Debug] React 水合信号未就绪（超时兜底），仍尝试点击")
 
         clicked = page.run_js(
             r"""
@@ -4682,7 +4730,13 @@ return 'clicked:' + ((target.innerText || target.textContent || '').replace(/\s+
             "browser_boot: signup_spa_stuck 未找到邮箱表单：页面停在「您正在登录」"
             "中间态（点击邮箱注册后未挂载输入框）"
         )
-    raise Exception("未找到「使用邮箱注册」按钮或邮箱表单未出现")
+    # Form never mounted (chooser still showing, hydration raced or JS dead):
+    # transient page-lifecycle class, not a hard reg fail. Slot retry + rotate
+    # applies — production 2026-11-19 lost a whole batch to this as kind=other.
+    raise AccountRetryNeeded(
+        "browser_boot: signup_form_not_mounted 未找到「使用邮箱注册」按钮或邮箱表单未出现"
+        "（选择页停留/水合未完成，slot 重试换路）"
+    )
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
