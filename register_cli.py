@@ -764,6 +764,21 @@ def is_mail_alloc_transport_error(msg: str) -> bool:
     return any(n in low for n in needles)
 
 
+_EXISTING_BURN_STREAK_LOCK = threading.Lock()
+_EXISTING_BURN_STREAK = {"n": 0}
+
+
+def _existing_burn_streak_inc() -> int:
+    with _EXISTING_BURN_STREAK_LOCK:
+        _EXISTING_BURN_STREAK["n"] += 1
+        return _EXISTING_BURN_STREAK["n"]
+
+
+def _existing_burn_streak_reset() -> None:
+    with _EXISTING_BURN_STREAK_LOCK:
+        _EXISTING_BURN_STREAK["n"] = 0
+
+
 def email_failure_should_burn_mailbox(msg: str) -> bool:
     """Whether a failure should permanently write ``emails_error.txt``.
 
@@ -1373,9 +1388,35 @@ def register_one(
                     # Burn the main so the picker stops handing it out, then swap
                     # mailbox — slot-retry on the same address is futile.
                     if EmailExistsError is not None and isinstance(exc, EmailExistsError):
-                        log(worker_id, f"! 邮箱在 xAI 已有账号（existing account），烧号并换邮箱: {msg}")
+                        # Exception carries the allocated address even when it
+                        # raised inside fill_email_and_submit before returning
+                        # (email-stage 400 email-signup-unavailable).
+                        burn_email = (getattr(exc, "email", "") or email or "").strip()
+                        log(
+                            worker_id,
+                            f"! 邮箱在 xAI 已有账号/不可注册（existing account），烧号并换邮箱: {msg} email={burn_email}",
+                        )
                         _inc("reg_fail")
-                        _mark_email_stage_error(email, f"existing_account: {msg[:120]}")
+                        streak = _existing_burn_streak_inc()
+                        limit = max(
+                            1,
+                            int(
+                                (getattr(reg, "config", {}) or {}).get(
+                                    "existing_account_fatal_streak", 5
+                                )
+                                or 5
+                            ),
+                        )
+                        if streak >= limit:
+                            fatal_msg = (
+                                f"连续 {streak} 个邮箱被判 existing account/"
+                                f"email-signup-unavailable（疑似 xAI 全局暂停邮箱注册，"
+                                f"或邮箱池整体已注册）——停止整批保护邮箱池: {msg[:120]}"
+                            )
+                            log(worker_id, f"! 致命错误，停止整批（不空转）: {fatal_msg}")
+                            request_fatal_stop(fatal_msg)
+                            raise FatalRegisterError(fatal_msg) from exc
+                        _mark_email_stage_error(burn_email, f"existing_account: {msg[:120]}")
                         try:
                             from proxy_rotate import note_egress_outcome
                             note_egress_outcome(
@@ -1400,11 +1441,15 @@ def register_one(
                             worker_id,
                             f"! 邮箱分配传输错误（通道不可用），推进 failover 换通道重试: {msg[:140]}",
                         )
+                        # Not an existing-account failure — streak counts only
+                        # CONSECUTIVE existing burns (global-pause circuit breaker).
+                        _existing_burn_streak_reset()
                         _clear_mail_provider_bind()
                         _advance_mail_provider_on_miss()
                         _soft_recycle_browser(worker_id)
                         reg.sleep_with_cancel(1, cancel)
                         continue
+                    _existing_burn_streak_reset()
                     kind = classify_email_stage_failure(msg)
                     if kind == "fatal":
                         log(worker_id, f"! 致命错误，停止整批（不空转）: {msg}")
@@ -1648,6 +1693,7 @@ def register_one(
             with open(accounts_file, "a", encoding="utf-8") as f:
                 f.write(line)
             log(worker_id, f"+ 注册成功: {email}")
+            _existing_burn_streak_reset()
             reg.mark_used(email, password)
             try:
                 import account_backup as _ab

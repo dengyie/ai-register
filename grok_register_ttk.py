@@ -544,12 +544,22 @@ class AccountRetryNeeded(Exception):
 class EmailExistsError(Exception):
     """Terminal mailbox defect: xAI says the account already exists.
 
-    xAI flow: verify-email returns 200 ``{"ok":true,"signInMethods":["EMAIL_PASSWORD"]}``
-    but the SPA falls back to the "Existing account found → Login with email"
-    chooser page. For Hotmail alias mode this means the **main** address was
-    already registered (aliases deliver to the same account) — retrying slots
-    or aliases is futile; burn the main so the picker stops handing it out.
+    Two production signatures (instabox3 2026-11-17/19):
+      - verify-email returns 200 ``{"ok":true,"signInMethods":["EMAIL_PASSWORD"]}``
+        but the SPA falls back to the "Existing account found → Login with email"
+        chooser page (caught at the code stage); or
+      - send-verification-code returns 400 ``account:email-signup-unavailable``
+        with "Email sign-up isn't available right now" (xAI refuses to send
+        signup codes to registered addresses — caught at the email stage).
+
+    For Hotmail alias mode this means the **main** address was already
+    registered (aliases deliver to the same account) — retrying slots or
+    aliases is futile; burn the main so the picker stops handing it out.
     """
+
+    def __init__(self, message: str = "", email: str = "", *args):
+        super().__init__(message, *args)
+        self.email = (email or "").strip()
 
 
 def load_config():
@@ -4980,6 +4990,31 @@ return hasLoginEmail ? 'existing-account' : 'maybe-existing';
 """
 
 
+_JS_EMAIL_SIGNUP_UNAVAILABLE_CHECK = r"""
+const text = (document.body.innerText || '');
+return /email sign-?up isn.t available|email sign-?up is not available/i.test(text)
+    || /邮箱注册暂不可用|电子邮件注册暂不可用|电子邮件注册目前不可用/.test(text);
+"""
+
+
+def _page_email_signup_unavailable(page) -> bool:
+    """True when xAI refused to send a signup code for this address.
+
+    Observed as send-verification-code 400 ``account:email-signup-unavailable``
+    + "Email sign-up isn't available right now" (note the U+2019 apostrophe —
+    the regex uses ``isn.t`` to match both ASCII and curly forms). Strong
+    existing-account signal: xAI does not send signup codes to registered
+    addresses (whole mangoqwq temp-mail pool behaves this way, 2026-11-17;
+    registered hotmail mains, 2026-11-19).
+    """
+    if page is None:
+        return False
+    try:
+        return bool(page.run_js(_JS_EMAIL_SIGNUP_UNAVAILABLE_CHECK))
+    except Exception:
+        return False
+
+
 def _page_is_existing_account(page) -> bool:
     """True when SPA fell back to the "Existing account found" chooser page.
 
@@ -5299,6 +5334,15 @@ return true;
                 cancel_callback=cancel_callback,
             ):
                 _netlog_diag_dump(page, "email-submit-fail", log_callback)
+                # xAI refused the send for this address (registered / not
+                # signable). Terminal mailbox defect — burn + swap, NOT a
+                # transient ARN (the old path re-picked the same dead main
+                # 3× and burned the whole slot budget, 2026-11-19).
+                if _page_email_signup_unavailable(page):
+                    raise EmailExistsError(
+                        "xAI 拒绝发送注册码（email-signup-unavailable，地址已注册/不可注册）",
+                        email=email,
+                    )
                 # Carry email so register_cli can release (not silent-lose) the
                 # reservation; post-submit SPA stall is not a permanent burn.
                 raise AccountRetryNeeded(

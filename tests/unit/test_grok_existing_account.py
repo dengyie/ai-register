@@ -29,18 +29,48 @@ def _load_cli_source() -> str:
     return (ROOT / "register_cli.py").read_text(encoding="utf-8")
 
 
+def test_email_signup_unavailable_detection_wired_at_email_stage() -> None:
+    """fill_email_and_submit must raise EmailExistsError (with email) on the 400.
+
+    Production (instabox3 2026-11-19): registered main → send-verification-code
+    400 account:email-signup-unavailable + "Email sign-up isn't available right
+    now" (U+2019 apostrophe). Old path raised ARN (transient, not burned) and
+    the picker re-handed the SAME dead main until slots ran out.
+    """
+    src = _load_ttk_source()
+    assert "_page_email_signup_unavailable" in src
+    # U+2019-safe regex + zh variants.
+    assert "isn.t available" in src
+    assert "邮箱注册暂不可用" in src
+    fn_start = src.index("def fill_email_and_submit(")
+    fn_end = src.index("\ndef ", fn_start + 10)
+    body = src[fn_start:fn_end]
+    assert body.count("_page_email_signup_unavailable(page)") >= 1
+    assert "raise EmailExistsError(" in body
+    assert "email=email" in body
+    # Detection must fire BEFORE the generic ARN raise in the same branch.
+    assert body.index("_page_email_signup_unavailable(page)") < body.index(
+        "邮箱提交后未进入验证码页"
+    )
+    print("PASS email-stage email-signup-unavailable → EmailExistsError(email=...)")
+
+
 def test_email_exists_error_class_defined() -> None:
     """EmailExistsError exists next to AccountRetryNeeded with docstring evidence."""
     src = _load_ttk_source()
     tree = ast.parse(src)
     names = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
     assert "EmailExistsError" in names
-    # Docstring pins the production signature (200 + signInMethods + chooser).
+    # Docstring pins both production signatures (chooser + 400) and carries email.
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "EmailExistsError")
     doc = ast.get_docstring(cls) or ""
     assert "Existing account" in doc
     assert "EMAIL_PASSWORD" in doc
-    print("PASS EmailExistsError defined with production-evidence docstring")
+    assert "email-signup-unavailable" in doc
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    args = [a.arg for a in init.args.args]
+    assert "email" in args, "EmailExistsError must carry the allocated address"
+    print("PASS EmailExistsError defined (both signatures docstring + email attr)")
 
 
 def test_existing_account_js_covers_en_and_chooser_confirmation() -> None:
@@ -101,12 +131,17 @@ def test_cli_swaps_mailbox_on_email_exists_without_slot_retry() -> None:
     # EmailExists handled by positive isinstance inside the generic clause.
     assert "if EmailExistsError is not None and isinstance(exc, EmailExistsError):" in body
     # Terminal burn + provider advance (swap mailbox, not slot).
-    assert '_mark_email_stage_error(email, f"existing_account:' in body
+    assert '_mark_email_stage_error(burn_email, f"existing_account:' in body
     assert "_advance_mail_provider_on_miss()" in body
-    # Allocation transport failover branch (email=="" gate).
-    assert "is_mail_alloc_transport_error" in body
+    # Transport failover branch (PR #7) still present with email=="" gate.
     assert "not email and is_mail_alloc_transport_error(msg)" in body
-    print("PASS register_cli burn+swap on EmailExistsError + transport failover, ARN first")
+    # Global-pause circuit breaker: streak counter with fatal stop.
+    assert "_existing_burn_streak_inc()" in body
+    assert "existing_account_fatal_streak" in body
+    assert "request_fatal_stop(fatal_msg)" in body
+    # Streak resets: success path + non-existing failure paths.
+    assert "_existing_burn_streak_reset()" in body
+    print("PASS register_cli burn+swap on EmailExistsError + streak breaker + resets")
 
 
 def test_mail_alloc_transport_error_matches_production_shapes() -> None:
