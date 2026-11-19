@@ -179,12 +179,14 @@ _EMAIL_PROVIDER_ALIASES = {
     "googlemail": "gmail",
     "cf": "cloudflare",
     "cloudflare_worker": "cloudflare",
+    "onemail": "one_mail",
+    "one-mail": "one_mail",
 }
 # Channels allowed in multi-select EMAIL_PROVIDERS pool.
 # gmail is allowed in the pool (console multi-select); operators still own
 # the risk that CF catch-all → Gmail IMAP may miss same-day xAI OTP.
 _EMAIL_PROVIDER_POOL_KNOWN = frozenset(
-    {"duckmail", "yyds", "cloudflare", "cloudmail", "hotmail", "gmail"}
+    {"duckmail", "yyds", "cloudflare", "cloudmail", "hotmail", "gmail", "one_mail"}
 )
 _EMAIL_PROVIDER_STRATEGIES = frozenset({"round_robin", "random", "failover"})
 _hotmail_token_map = {}
@@ -3584,6 +3586,8 @@ def _allocate_email_for_provider(provider: str, api_key=None):
         return fixed, token
     if provider in ("hotmail", "outlook", "outlookmail", "microsoft"):
         return hotmail_get_email_and_token()
+    if provider == "one_mail":
+        return one_mail_get_email_and_token()
     if provider in ("gmail", "google", "googlemail"):
         return gmail_get_email_and_token()
     if provider == "yyds":
@@ -3826,6 +3830,17 @@ def get_oai_code(
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
         )
+    if provider == "one_mail":
+        return one_mail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+            not_before_ts=not_before_ts,
+        )
     return duckmail_get_oai_code(
         dev_token,
         email,
@@ -3846,6 +3861,103 @@ def extract_verification_code(text, subject=""):
     """
     code = extract_otp_code(text, subject=subject)
     return code if code else None
+
+
+# --- one_mail channel (catch-all supply; pool is 100% consumed — see vault
+# 2026-11-20). Reuses register_core OneMailSource (admin channel, PR #5 quota
+# backoff). Secrets stay in env (ONEMAIL_ADMIN_KEY), never config.json. ---
+
+_onemail_source = None
+_onemail_token_map = {}
+_onemail_lock = threading.Lock()
+
+
+def _get_onemail_source():
+    global _onemail_source
+    with _onemail_lock:
+        if _onemail_source is None:
+            try:
+                from register_core.email.sources.one_mail import OneMailSource
+            except Exception as exc:
+                raise Exception(f"one_mail source import failed: {exc}") from exc
+            _onemail_source = OneMailSource(
+                base_url=str(
+                    config.get("onemail_api_base")
+                    or os.environ.get("ONEMAIL_API_BASE")
+                    or ""
+                ).strip() or None,
+                auth_mode="admin",
+                admin_key=str(os.environ.get("ONEMAIL_ADMIN_KEY") or "").strip(),
+                domains=str(
+                    config.get("onemail_domains")
+                    or os.environ.get("ONEMAIL_DOMAINS")
+                    or "dengyie.tech"
+                ).strip(),
+            )
+        return _onemail_source
+
+
+def one_mail_get_email_and_token():
+    """Allocate a fresh catch-all address (admin channel, no API call needed)."""
+    src = _get_onemail_source()
+    mailbox = src.allocate()
+    token_key = "one_mail:" + secrets.token_urlsafe(18)
+    with _onemail_lock:
+        _onemail_token_map[token_key] = mailbox
+    return mailbox.address, token_key
+
+
+def one_mail_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+    not_before_ts=None,
+):
+    """Poll OTP via OneMailSource (admin unified verifcodes, quota-aware)."""
+    with _onemail_lock:
+        mailbox = _onemail_token_map.get(dev_token)
+    if mailbox is None or mailbox.address.lower() != str(email).lower():
+        # Rebuild from the address itself (admin channel needs no jwt).
+        from register_core.contracts import Mailbox as _Mailbox
+        mailbox = _Mailbox(address=email, token="", provider="one_mail")
+    src = _get_onemail_source()
+    deadline_kws = {
+        "timeout_s": float(max(10, int(timeout or 180))),
+        "poll_interval_s": float(max(1, float(poll_interval or 3))),
+        "newer_than_epoch": float(not_before_ts) if not_before_ts else None,
+    }
+    last_err = None
+    deadline = time.time() + deadline_kws["timeout_s"]
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        try:
+            otp = src.poll_otp(
+                mailbox,
+                timeout_s=min(deadline_kws["timeout_s"], max(10, deadline - time.time())),
+                poll_interval_s=deadline_kws["poll_interval_s"],
+                newer_than_epoch=deadline_kws["newer_than_epoch"],
+            )
+        except Exception as exc:
+            # QuotaLimitedError carries retry_at — surface it so callers see
+            # "worker 配额" instead of a generic miss; retry within window.
+            last_err = exc
+            msg = str(exc)
+            if "D1_DAILY" in msg or "quota" in msg.lower():
+                if log_callback:
+                    log_callback(f"[one_mail] 配额/传输等待重试: {msg[:120]}")
+                sleep_with_cancel(min(30, max(5, deadline - time.time())), cancel_callback)
+                continue
+            raise
+        if otp and getattr(otp, "code", ""):
+            return str(otp.code)
+        sleep_with_cancel(deadline_kws["poll_interval_s"], cancel_callback)
+    if last_err is not None:
+        raise Exception(f"one_mail 取码失败: {last_err}")
+    raise Exception("one_mail 取码超时（未收到验证码）")
 
 
 def duckmail_get_oai_code(
