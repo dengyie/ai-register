@@ -541,6 +541,17 @@ class AccountRetryNeeded(Exception):
         self.email = (email or "").strip()
 
 
+class EmailExistsError(Exception):
+    """Terminal mailbox defect: xAI says the account already exists.
+
+    xAI flow: verify-email returns 200 ``{"ok":true,"signInMethods":["EMAIL_PASSWORD"]}``
+    but the SPA falls back to the "Existing account found → Login with email"
+    chooser page. For Hotmail alias mode this means the **main** address was
+    already registered (aliases deliver to the same account) — retrying slots
+    or aliases is futile; burn the main so the picker stops handing it out.
+    """
+
+
 def load_config():
     load_env()
     global config
@@ -4904,6 +4915,33 @@ def wait_for_profile_form(timeout=20, log_callback=None, cancel_callback=None):
     return False
 
 
+_JS_EXISTING_ACCOUNT_CHECK = r"""
+const text = (document.body.innerText || '').replace(/\s+/g, ' ');
+if (!/Existing account found|已有账号|账号已存在/i.test(text)) return '';
+// Confirmation: the chooser page offers login methods, not signup inputs.
+const hasLoginEmail = Array.from(document.querySelectorAll('button,[role="button"]')).some(
+  (n) => /login with email|使用邮箱登录/i.test((n.innerText || n.textContent || ''))
+);
+return hasLoginEmail ? 'existing-account' : 'maybe-existing';
+"""
+
+
+def _page_is_existing_account(page) -> bool:
+    """True when SPA fell back to the "Existing account found" chooser page.
+
+    Observed after verify-email 200 when the mailbox (Hotmail main behind a
+    random alias) already has an xAI account. Must be checked before treating
+    "code input disappeared" as auto-advance — the chooser also has no code
+    input, which previously spun the retry loop for minutes.
+    """
+    if page is None:
+        return False
+    try:
+        return bool(page.run_js(_JS_EXISTING_ACCOUNT_CHECK))
+    except Exception:
+        return False
+
+
 def _page_has_code_form(page) -> bool:
     """True when OTP / one-time-code inputs are visible (post email-submit)."""
     if page is None:
@@ -5309,6 +5347,13 @@ return false;
         remaining = deadline - time.time()
         if remaining <= 0:
             break
+        # Chooser-page guard: after one failed submit the SPA may already be on
+        # the "Existing account found" page; filling code there is dead work.
+        if code_filled_once and _page_is_existing_account(page):
+            _diag("existing-account")
+            raise EmailExistsError(
+                f"xAI 判定该邮箱已有账号（重试前检测）: email={email}"
+            )
         filled = page.run_js(
             """
 const codeRaw = String(arguments[0] || '').trim();
@@ -5459,6 +5504,12 @@ return 'pending';
             if log_callback:
                 log_callback(f"[*] 已填写验证码并点击提交按钮: {code}")
             human_sleep(1.5, cancel_callback, min_seconds=0.8)
+            if _page_is_existing_account(page):
+                _diag("existing-account")
+                raise EmailExistsError(
+                    f"xAI 判定该邮箱已有账号（点击提交后回退 Existing account 选择页）: "
+                    f"email={email} code={code}"
+                )
             if wait_for_profile_form(timeout=wait_budget, log_callback=log_callback, cancel_callback=cancel_callback):
                 return code
             if log_callback:
@@ -5468,6 +5519,12 @@ return 'pending';
             if log_callback:
                 log_callback(f"[*] 验证码已填写，步骤疑似自动推进: {code}")
             human_sleep(1.0, cancel_callback, min_seconds=0.6)
+            if _page_is_existing_account(page):
+                _diag("existing-account")
+                raise EmailExistsError(
+                    f"xAI 判定该邮箱已有账号（verify-email 200 但回退 Existing account 选择页）: "
+                    f"email={email} code={code}"
+                )
             if wait_for_profile_form(timeout=wait_budget, log_callback=log_callback, cancel_callback=cancel_callback):
                 return code
             _diag("advanced-timeout")

@@ -1213,6 +1213,7 @@ def register_one(
     AccountRetryNeeded is handled internally (slot retry); not re-raised to worker.
     """
     AccountRetryNeeded = reg.AccountRetryNeeded
+    EmailExistsError = getattr(reg, "EmailExistsError", None)
 
     email = ""
     dev_token = ""
@@ -1324,6 +1325,35 @@ def register_one(
                     log(worker_id, f"验证码: {code}")
                     mail_ok = True
                     break
+                except Exception as exc:
+                    # xAI "Existing account found": terminal mailbox defect (the
+                    # Hotmail MAIN behind this alias already has an xAI account).
+                    # Burn the main so the picker stops handing it out, then swap
+                    # mailbox — slot-retry on the same address is futile.
+                    # NOTE: must re-raise non-EmailExists immediately so the
+                    # following AccountRetryNeeded / Exception handlers keep
+                    # their original semantics (ARN is an Exception subclass;
+                    # a broad except placed ahead of it would swallow it).
+                    if not (EmailExistsError is not None and isinstance(exc, EmailExistsError)):
+                        raise
+                    msg = str(exc)
+                    log(worker_id, f"! 邮箱在 xAI 已有账号（existing account），烧号并换邮箱: {msg}")
+                    _inc("reg_fail")
+                    _mark_email_stage_error(email, f"existing_account: {msg[:120]}")
+                    try:
+                        from proxy_rotate import note_egress_outcome
+                        note_egress_outcome(
+                            "existing_account",
+                            log=lambda m: log(worker_id, m),
+                            config=getattr(reg, "config", None),
+                        )
+                    except Exception:
+                        pass
+                    _clear_mail_provider_bind()
+                    _advance_mail_provider_on_miss()
+                    _soft_recycle_browser(worker_id)
+                    reg.sleep_with_cancel(1, cancel)
+                    continue
                 except AccountRetryNeeded:
                     _clear_mail_provider_bind()
                     _clear_reg_domain_hint()
