@@ -542,24 +542,38 @@ class AccountRetryNeeded(Exception):
 
 
 class EmailExistsError(Exception):
-    """Terminal mailbox defect: xAI says the account already exists.
+    """xAI refused signup for this address.
 
     Two production signatures (instabox3 2026-11-17/19):
-      - verify-email returns 200 ``{"ok":true,"signInMethods":["EMAIL_PASSWORD"]}``
-        but the SPA falls back to the "Existing account found → Login with email"
-        chooser page (caught at the code stage); or
-      - send-verification-code returns 400 ``account:email-signup-unavailable``
-        with "Email sign-up isn't available right now" (xAI refuses to send
-        signup codes to registered addresses — caught at the email stage).
+      - chooser stage (``stage="chooser"``): verify-email returned 200
+        ``{"ok":true,"signInMethods":["EMAIL_PASSWORD"]}`` and the SPA fell
+        back to the "Existing account found → Login with email" page.
+        Always address-state — burn is correct.
+      - send stage (``stage="send"``): send-verification-code returned 400
+        ``account:email-signup-unavailable`` + "Email sign-up isn't available
+        right now". **Ambiguous**: registered addresses get it (xAI won't send
+        signup codes to registered addresses), but production 2026-11-19
+        proved FRESH never-registered addresses also get it when xAI gates
+        sends by egress reputation (deep-pool zero-consumed main 400'd like
+        the registered cohort). Burn decisions for send-stage MUST check
+        whether this egress recently completed a send (see register_cli
+        send-gate tracking).
 
-    For Hotmail alias mode this means the **main** address was already
+    For Hotmail alias mode an existing account means the **main** was
     registered (aliases deliver to the same account) — retrying slots or
-    aliases is futile; burn the main so the picker stops handing it out.
+    aliases is futile once address-state is confirmed.
     """
 
-    def __init__(self, message: str = "", email: str = "", *args):
+    def __init__(
+        self,
+        message: str = "",
+        email: str = "",
+        stage: str = "chooser",
+        *args,
+    ):
         super().__init__(message, *args)
         self.email = (email or "").strip()
+        self.stage = (stage or "chooser").strip().lower()
 
 
 def load_config():
@@ -5365,8 +5379,9 @@ return true;
                 # 3× and burned the whole slot budget, 2026-11-19).
                 if _page_email_signup_unavailable(page):
                     raise EmailExistsError(
-                        "xAI 拒绝发送注册码（email-signup-unavailable，地址已注册/不可注册）",
+                        "xAI 拒绝发送注册码（email-signup-unavailable，地址已注册或出口被门禁）",
                         email=email,
+                        stage="send",
                     )
                 # Carry email so register_cli can release (not silent-lose) the
                 # reservation; post-submit SPA stall is not a permanent burn.

@@ -70,7 +70,40 @@ def test_email_exists_error_class_defined() -> None:
     init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
     args = [a.arg for a in init.args.args]
     assert "email" in args, "EmailExistsError must carry the allocated address"
-    print("PASS EmailExistsError defined (both signatures docstring + email attr)")
+    assert "stage" in args, "EmailExistsError must carry send/chooser stage"
+    print("PASS EmailExistsError defined (both signatures docstring + email/stage attrs)")
+
+
+def test_send_stage_400_is_egress_aware_not_blind_burn() -> None:
+    """register_cli: send-stage 400 burns ONLY when this egress proved sends work.
+
+    Production disambiguation (instabox3 2026-11-19): deep-pool ZERO-consumed
+    main DominicNoles6439081 400'd identically to the registered cohort → the
+    send gate is egress-wide. Blind burn would eat the whole pool; burn must
+    be gated on _send_ok_egress_seen(current label), and gate-class ARNs must
+    never burn via email_failure_should_burn_mailbox.
+    """
+    src = _load_cli_source()
+    # Stage tracking helpers exist with TTL.
+    assert "_send_ok_egress_mark" in src and "_send_ok_egress_seen" in src
+    assert "_SEND_OK_EGRESS_TTL" in src
+    fn_start = src.index("def register_one(")
+    fn_end = src.index("\ndef ", fn_start + 10)
+    body = src[fn_start:fn_end]
+    # Send-ok marked right after a successful fill_email_and_submit.
+    assert "_send_ok_egress_mark(current_egress_label())" in body
+    # send-stage gate: no-proof → transient ARN carrying the address.
+    assert 'if stage == "send" and not _send_ok_egress_seen(' in body
+    assert 'f"email_signup_gate: {msg[:160]}", email=burn_email' in body
+    # Chooser-stage and proven-egress path still burns.
+    assert "_existing_burn_streak_inc()" in body
+    # Gate-class messages are exempt from mailbox burn.
+    burn_start = src.index("def email_failure_should_burn_mailbox(")
+    burn_end = src.index("\ndef ", burn_start + 10)
+    burn_body = src[burn_start:burn_end]
+    assert '"email_signup_gate" in text' in burn_body
+    assert '"email-signup-unavailable" in text' in burn_body
+    print("PASS send-stage 400 egress-aware; gate ARN exempt from burn")
 
 
 def test_existing_account_js_covers_en_and_chooser_confirmation() -> None:
@@ -273,8 +306,12 @@ def test_cli_stays_on_provider_after_mailbox_burn() -> None:
     ex_start = body.index("if EmailExistsError is not None and isinstance(exc, EmailExistsError):")
     ex_end = body.index("# Mailbox ALLOCATION transport error")
     email_exists_block = body[ex_start:ex_end]
-    assert "_clear_mail_provider_bind()" not in email_exists_block
-    assert "_advance_mail_provider_on_miss()" not in email_exists_block
+    # Gate path (no send-proof) may clear bind (transient rotate class); the
+    # BURN path must NOT clear/advance (stay bound on the healthy channel).
+    burn_start = email_exists_block.index("existing account/{stage}")
+    burn_block = email_exists_block[burn_start:]
+    assert "_clear_mail_provider_bind()" not in burn_block
+    assert "_advance_mail_provider_on_miss()" not in burn_block
     # Transport branch skips the failed channel before clearing the bind.
     tr_start = body.index("# Mailbox ALLOCATION transport error")
     tr_end = body.index("kind = classify_email_stage_failure(msg)", tr_start)

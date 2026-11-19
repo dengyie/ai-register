@@ -766,6 +766,51 @@ def is_mail_alloc_transport_error(msg: str) -> bool:
 
 _EXISTING_BURN_STREAK_LOCK = threading.Lock()
 _EXISTING_BURN_STREAK = {"n": 0}
+# Egress labels that completed at least one send-verification-code inside this
+# process. xAI send-stage 400 email-signup-unavailable is ambiguous (registered
+# address vs egress-gated): 2026-11-19 a deep-pool zero-consumed main 400'd
+# exactly like the registered cohort while the egress was gated. Burn on
+# send-stage 400 ONLY when this egress recently proved sends work; otherwise
+# treat as transient (rotate egress, keep the address).
+_SEND_OK_EGRESS_LOCK = threading.Lock()
+_SEND_OK_EGRESS_LABELS: set[str] = set()
+_SEND_OK_EGRESS_TTL = 1800.0  # seconds a send-success keeps proving an egress
+
+
+def _send_ok_egress_mark(label: str) -> None:
+    label = (label or "").strip()
+    if not label:
+        return
+    now = time.time()
+    with _SEND_OK_EGRESS_LOCK:
+        _SEND_OK_EGRESS_LABELS.add(f"{now:.0f}|{label}")
+        # TTL prune.
+        alive = set()
+        for item in _SEND_OK_EGRESS_LABELS:
+            try:
+                ts, lab = item.split("|", 1)
+                if now - float(ts) <= _SEND_OK_EGRESS_TTL:
+                    alive.add(item)
+            except Exception:
+                alive.add(item)
+        _SEND_OK_EGRESS_LABELS.clear()
+        _SEND_OK_EGRESS_LABELS.update(alive)
+
+
+def _send_ok_egress_seen(label: str) -> bool:
+    label = (label or "").strip()
+    if not label:
+        return False
+    now = time.time()
+    with _SEND_OK_EGRESS_LOCK:
+        for item in _SEND_OK_EGRESS_LABELS:
+            try:
+                ts, lab = item.split("|", 1)
+                if lab == label and now - float(ts) <= _SEND_OK_EGRESS_TTL:
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def _existing_burn_streak_inc() -> int:
@@ -807,6 +852,9 @@ def email_failure_should_burn_mailbox(msg: str) -> bool:
 
     # Egress / CF human-check — never a mailbox defect.
     if is_turnstile_stuck_error(text):
+        return False
+    # xAI send gate (egress reputation): address may be perfectly fresh.
+    if "email_signup_gate" in text or "email-signup-unavailable" in text:
         return False
     if "wait-cloudflare" in text or "token_len=0" in text or "token长度=0" in text:
         return False
@@ -1372,6 +1420,12 @@ def register_one(
                         set_registration_domain(email)
                     except Exception:
                         pass
+                    # fill_email_and_submit returns only after the code form
+                    # appeared — the send succeeded on the CURRENT egress.
+                    try:
+                        _send_ok_egress_mark(current_egress_label())
+                    except Exception:
+                        pass
                     try:
                         provider_now = reg.get_email_provider()
                     except Exception:
@@ -1403,13 +1457,32 @@ def register_one(
                     # Burn the main so the picker stops handing it out, then swap
                     # mailbox — slot-retry on the same address is futile.
                     if EmailExistsError is not None and isinstance(exc, EmailExistsError):
-                        # Exception carries the allocated address even when it
-                        # raised inside fill_email_and_submit before returning
-                        # (email-stage 400 email-signup-unavailable).
+                        msg = str(exc)
+                        stage = str(getattr(exc, "stage", "") or "chooser").lower()
                         burn_email = (getattr(exc, "email", "") or email or "").strip()
+                        # send-stage 400 is ambiguous (registered address vs
+                        # egress-gated — 2026-11-19 deep-pool fresh main 400'd
+                        # under the gate). Burn only when THIS egress recently
+                        # completed a send; otherwise transient → slot retry
+                        # rotates the egress and the address stays available.
+                        if stage == "send" and not _send_ok_egress_seen(
+                            current_egress_label()
+                        ):
+                            log(
+                                worker_id,
+                                f"! email-signup-unavailable（出口疑似被门禁，本轮该出口未成功发过信）"
+                                f"——不烧号，换路重试: {msg[:120]} email={burn_email}",
+                            )
+                            _clear_mail_provider_bind()
+                            _skip_failed_mail_provider()
+                            _soft_recycle_browser(worker_id)
+                            reg.sleep_with_cancel(1, cancel)
+                            raise AccountRetryNeeded(
+                                f"email_signup_gate: {msg[:160]}", email=burn_email
+                            ) from exc
                         log(
                             worker_id,
-                            f"! 邮箱在 xAI 已有账号/不可注册（existing account），烧号并换邮箱: {msg} email={burn_email}",
+                            f"! 邮箱在 xAI 已有账号/不可注册（existing account/{stage}），烧号并换邮箱: {msg} email={burn_email}",
                         )
                         _inc("reg_fail")
                         streak = _existing_burn_streak_inc()
