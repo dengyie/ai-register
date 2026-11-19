@@ -207,3 +207,80 @@ def test_diag_emitted_at_existing_account_sites() -> None:
     body = src[fn_start:fn_end]
     assert body.count('_diag("existing-account")') >= 3
     print("PASS netlog diag dumped at every existing-account raise site")
+
+
+def test_skip_email_provider_failed_rr_repoint() -> None:
+    """skip_email_provider_failed re-points RR past the failed member.
+
+    Extracted via AST exec with stubbed pool/strategy/bind (no ttk import —
+    execve re-exec under pytest). pool [cloudflare, hotmail], failed=cloudflare
+    → rr_index becomes 1 → next pick hotmail. Single pool / unknown member /
+    failover strategy keep prior behavior.
+    """
+    src = _load_ttk_source()
+    tree = ast.parse(src)
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "skip_email_provider_failed"
+    )
+    adv = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "advance_email_provider_failover"
+    )
+    mod = ast.Module(body=[fn, adv], type_ignores=[])
+    ast.fix_missing_locations(mod)
+
+    def run_case(pool, strategy, bound, rr_index):
+        ns = {
+            "get_email_providers_pool": lambda: pool,
+            "get_email_provider_strategy": lambda: strategy,
+            "get_bound_email_provider": lambda: bound,
+            "_email_provider_tls": type("T", (), {"failover_index": 0})(),
+            "clear_email_provider_bind": lambda: None,
+            "_email_provider_rr_index": rr_index,
+            "_email_provider_rr_lock": __import__("threading").Lock(),
+        }
+        exec(compile(mod, "<skip>", "exec"), ns)
+        ns["skip_email_provider_failed"]()
+        return ns["_email_provider_rr_index"], ns["_email_provider_tls"].failover_index
+
+    # RR: failed cloudflare → index re-pointed to 1 (hotmail next).
+    rr, fi = run_case(["cloudflare", "hotmail"], "round_robin", "cloudflare", 7)
+    assert rr == 1 and fi == 0
+    # Unknown/absent bind → untouched.
+    rr, fi = run_case(["cloudflare", "hotmail"], "round_robin", None, 5)
+    assert rr == 5
+    # Single-member pool → untouched.
+    rr, fi = run_case(["hotmail"], "round_robin", "hotmail", 3)
+    assert rr == 3
+    # Failover strategy → failover index raised, RR untouched.
+    rr, fi = run_case(["cloudflare", "hotmail"], "failover", "cloudflare", 9)
+    assert fi == 1 and rr == 9
+    print("PASS skip_email_provider_failed RR re-point + failover + no-ops")
+
+
+def test_cli_stays_on_provider_after_mailbox_burn() -> None:
+    """EmailExists branch must NOT clear/advance the provider bind.
+
+    Mailbox burned ≠ channel broken: clearing made RR bounce back to the dead
+    cloudflare member; staying bound keeps hotmail for the next mail_try.
+    Transport branch keeps the skip (bias away from failed channel).
+    """
+    src = _load_cli_source()
+    fn_start = src.index("def register_one(")
+    fn_end = src.index("\ndef ", fn_start + 10)
+    body = src[fn_start:fn_end]
+    ex_start = body.index("if EmailExistsError is not None and isinstance(exc, EmailExistsError):")
+    ex_end = body.index("# Mailbox ALLOCATION transport error")
+    email_exists_block = body[ex_start:ex_end]
+    assert "_clear_mail_provider_bind()" not in email_exists_block
+    assert "_advance_mail_provider_on_miss()" not in email_exists_block
+    # Transport branch skips the failed channel before clearing the bind.
+    tr_start = body.index("# Mailbox ALLOCATION transport error")
+    tr_end = body.index("kind = classify_email_stage_failure(msg)", tr_start)
+    transport_block = body[tr_start:tr_end]
+    assert "_skip_failed_mail_provider()" in transport_block
+    # Helper defined and clears AFTER skip.
+    helper_pos = body.index("def _skip_failed_mail_provider()")
+    assert "_clear_mail_provider_bind()" in body[helper_pos:helper_pos + 1100]
+    print("PASS EmailExists keeps bind; transport branch skips failed channel")

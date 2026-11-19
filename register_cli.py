@@ -1311,6 +1311,21 @@ def register_one(
                 except Exception:
                     pass
 
+            def _skip_failed_mail_provider() -> None:
+                """Bias next pool pick away from the just-failed member.
+
+                Must run BEFORE _clear_mail_provider_bind (it reads the TLS
+                bind to know which member failed). RR: re-point index past the
+                failed member (dead cloudflare no longer wastes a try);
+                failover strategy: raise failover index.
+                """
+                try:
+                    if hasattr(reg, "skip_email_provider_failed"):
+                        reg.skip_email_provider_failed()
+                except Exception:
+                    pass
+                _clear_mail_provider_bind()
+
             def _clear_reg_domain_hint() -> None:
                 # Layer ③: drop the rotator hint so a later rotate for another
                 # account never soft-prefers this account's domain pair.
@@ -1426,8 +1441,10 @@ def register_one(
                             )
                         except Exception:
                             pass
-                        _clear_mail_provider_bind()
-                        _advance_mail_provider_on_miss()
+                        # Mailbox burned, NOT the channel: keep the TLS bind so
+                        # the next mail_try stays on this (healthy) provider and
+                        # picks its next main — do NOT clear/advance (clearing
+                        # made RR bounce back to the dead cloudflare channel).
                         _soft_recycle_browser(worker_id)
                         reg.sleep_with_cancel(1, cancel)
                         continue
@@ -1444,7 +1461,9 @@ def register_one(
                         # Not an existing-account failure — streak counts only
                         # CONSECUTIVE existing burns (global-pause circuit breaker).
                         _existing_burn_streak_reset()
-                        _clear_mail_provider_bind()
+                        # Skip BEFORE clear (skip reads the TLS bind to identify
+                        # the failed member); then advance failover index too.
+                        _skip_failed_mail_provider()
                         _advance_mail_provider_on_miss()
                         _soft_recycle_browser(worker_id)
                         reg.sleep_with_cancel(1, cancel)

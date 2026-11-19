@@ -3510,6 +3510,31 @@ def advance_email_provider_failover() -> None:
     clear_email_provider_bind()
 
 
+def skip_email_provider_failed() -> None:
+    """Bias the next pool selection away from the just-failed member.
+
+    Production (instabox3 2026-11-19): pool [cloudflare(dead NXDOMAIN),
+    hotmail] under round_robin — after a transport failover the RR index kept
+    alternating back to the dead cloudflare channel, wasting one mail_try per
+    account. Under round_robin we re-point the RR index to the member AFTER
+    the failed one; under failover strategy we raise the failover index as
+    before. Single-member pools are a no-op.
+    """
+    pool = get_email_providers_pool()
+    if len(pool) <= 1:
+        return
+    if get_email_provider_strategy() == "failover":
+        advance_email_provider_failover()
+        return
+    failed = get_bound_email_provider()
+    if not failed or failed not in pool:
+        return
+    global _email_provider_rr_index
+    with _email_provider_rr_lock:
+        # Next RR pick lands on the member after the failed one.
+        _email_provider_rr_index = pool.index(failed) + 1
+
+
 def reset_email_provider_failover() -> None:
     _email_provider_tls.failover_index = 0
 
