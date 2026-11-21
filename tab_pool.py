@@ -296,6 +296,15 @@ def _ps_ax_pid_ppid_cmd() -> str:
 
 def _term_then_kill(pid: int, *, term_grace_sec: float) -> bool:
     """SIGTERM then SIGKILL. Returns True if we sent at least one signal."""
+    if os.name == "nt":
+        # Windows: os.kill only supports signal.SIGTERM*'s CTRL events and
+        # signal.SIGTERM raises, and there is no SIGKILL — taskkill /F.
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                           capture_output=True, timeout=10)
+            return True
+        except Exception:
+            return False
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -326,6 +335,16 @@ def kill_process_tree(pid: int, *, term_grace_sec: float = 1.0) -> bool:
         return False
     pid = int(pid)
     signaled = False
+    # Windows has no process groups / SIGKILL — taskkill /T covers the tree.
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=10,
+            )
+            return True
+        except Exception:
+            return False
     try:
         pgid = int(os.getpgid(pid))
     except (ProcessLookupError, PermissionError, OSError):
@@ -915,7 +934,11 @@ class TabPool:
             kill_process_tree(int(pid), term_grace_sec=0.4)
         except Exception:
             try:
-                os.kill(int(pid), signal.SIGKILL)
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                                   capture_output=True, timeout=10)
+                else:
+                    os.kill(int(pid), signal.SIGKILL)
             except (OSError, PermissionError):
                 pass
 
